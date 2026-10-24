@@ -1,5 +1,6 @@
 """Smoke tests for importability only; they do not prove processing works."""
 from fastapi import FastAPI
+
 from orchestrator.main import app
 
 

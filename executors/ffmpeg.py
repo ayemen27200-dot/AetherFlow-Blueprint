@@ -1,7 +1,10 @@
 """FFmpeg split executor scaffold. Commands must use argv arrays, not shell strings."""
 
 from __future__ import annotations
-from typing import Any, Callable
+
+from collections.abc import Callable
+from typing import Any
+
 from .base import Executor
 
 
@@ -13,4 +16,6 @@ class FFmpegSplitExecutor(Executor):
 
     def run(self, job_spec: dict[str, Any], on_progress: Callable[[float], None]) -> dict[str, Any]:
         del job_spec, on_progress
-        raise NotImplementedError("Implement FFprobe validation, bounded FFmpeg subprocess and output checks")
+        raise NotImplementedError(
+            "Implement FFprobe validation, bounded FFmpeg subprocess and output checks"
+        )

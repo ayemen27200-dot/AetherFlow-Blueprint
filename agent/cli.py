@@ -24,7 +24,8 @@ def split(
     """Placeholder CLI command; the split executor is not implemented yet."""
     del file, segment_sec, local
     typer.echo(
-        "Job execution is not implemented in this scaffold. Complete D2_MVP and its acceptance gate.",
+        "Job execution is not implemented in this scaffold. "
+        "Complete D2_MVP and its acceptance gate.",
         err=True,
     )
     raise typer.Exit(code=2)

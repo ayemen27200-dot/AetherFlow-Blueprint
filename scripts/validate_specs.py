@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate the YAML syntax and basic local-reference integrity of the specs."""
 from __future__ import annotations
+
 import json
 import sys
 from pathlib import Path
@@ -10,7 +11,7 @@ try:
     import yaml
 except ImportError:
     print("PyYAML is required. Install with: python -m pip install -e '.[dev]'", file=sys.stderr)
-    raise SystemExit(2)
+    raise SystemExit(2) from None
 
 ROOT = Path(__file__).resolve().parents[1]
 YAML_FILES = [
@@ -86,8 +87,14 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    print(f"OK: parsed {len(parsed)} YAML files; OpenAPI 3.1 local references resolve; model lock JSON parses.")
-    print("Note: this is not a replacement for openapi-spec-validator or a runtime integration test.")
+    print(
+        f"OK: parsed {len(parsed)} YAML files; OpenAPI 3.1 local references resolve; "
+        "model lock JSON parses."
+    )
+    print(
+        "Note: this is not a replacement for openapi-spec-validator "
+        "or a runtime integration test."
+    )
     return 0
 
 if __name__ == "__main__":

@@ -19,7 +19,7 @@ try:
     import yaml
 except ImportError:
     print("PyYAML is required. Install with: python -m pip install -e '.[dev]'", file=sys.stderr)
-    raise SystemExit(2)
+    raise SystemExit(2) from None
 
 BANNER = r"""
 ╔═══════════════════════════════════════════════════════════╗
@@ -98,7 +98,8 @@ def locate_project_root() -> Path:
     )
     if root is None:
         raise SystemExit(
-            "Run this wizard from the AetherFlow project root (the directory containing .env.example)."
+            "Run this wizard from the AetherFlow project root "
+            "(the directory containing .env.example)."
         )
     return root
 
@@ -118,12 +119,24 @@ def write_private_file(path: Path, contents: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--non-interactive", action="store_true", help="Use safe defaults; never prompt")
+    parser.add_argument(
+        "--non-interactive", action="store_true", help="Use safe defaults; never prompt"
+    )
     parser.add_argument("--domain", default=None, help="Public domain or localhost")
-    parser.add_argument("--acme-email", default=None, help="Email used for TLS certificate issuance")
+    parser.add_argument(
+        "--acme-email", default=None, help="Email used for TLS certificate issuance"
+    )
     parser.add_argument("--tier", choices=["free", "paid_optional", "local_only"], default=None)
-    parser.add_argument("--force-secrets", action="store_true", help="Rotate generated server/agent secrets")
-    parser.add_argument("--force-config", action="store_true", help="Replace an existing config/config.yaml")
+    parser.add_argument(
+        "--force-secrets",
+        action="store_true",
+        help="Rotate generated server/agent secrets",
+    )
+    parser.add_argument(
+        "--force-config",
+        action="store_true",
+        help="Replace an existing config/config.yaml",
+    )
     args = parser.parse_args(argv)
     interactive = not args.non_interactive
 
@@ -141,8 +154,15 @@ def main(argv: list[str] | None = None) -> int:
         interactive=interactive,
     )
     use_phone = ask_bool("2/6 — Configure a Termux phone agent?", False, interactive=interactive)
-    phone_host = ask("Phone SSH host/name", existing_env.get("PHONE_HOST", "phone"), interactive=interactive) \
-        if use_phone else ""
+    phone_host = (
+        ask(
+            "Phone SSH host/name",
+            existing_env.get("PHONE_HOST", "phone"),
+            interactive=interactive,
+        )
+        if use_phone
+        else ""
+    )
 
     use_modal = ask_bool(
         "3/6 — Enable the optional Modal integration? (usage/cost must be verified separately)",
@@ -153,9 +173,17 @@ def main(argv: list[str] | None = None) -> int:
     modal_secret = existing_env.get("MODAL_TOKEN_SECRET", "")
     if use_modal:
         if not modal_id:
-            modal_id = ask("Modal token ID (leave empty to configure later)", secret=True, interactive=interactive)
+            modal_id = ask(
+                "Modal token ID (leave empty to configure later)",
+                secret=True,
+                interactive=interactive,
+            )
         if not modal_secret:
-            modal_secret = ask("Modal token secret (leave empty to configure later)", secret=True, interactive=interactive)
+            modal_secret = ask(
+                "Modal token secret (leave empty to configure later)",
+                secret=True,
+                interactive=interactive,
+            )
 
     use_telegram = ask_bool(
         "4/6 — Enable Telegram notifications?",
@@ -166,14 +194,24 @@ def main(argv: list[str] | None = None) -> int:
     telegram_chat = existing_env.get("TELEGRAM_CHAT_ID", "")
     if use_telegram:
         if not telegram_token:
-            telegram_token = ask("Telegram bot token (leave empty to configure later)", secret=True, interactive=interactive)
+            telegram_token = ask(
+                "Telegram bot token (leave empty to configure later)",
+                secret=True,
+                interactive=interactive,
+            )
         if not telegram_chat:
             telegram_chat = ask("Telegram chat ID", interactive=interactive)
 
     domain_default = args.domain or existing_env.get("DOMAIN") or "localhost"
     email_default = args.acme_email or existing_env.get("ACME_EMAIL") or "admin@example.com"
-    domain = args.domain or ask("5/6 — Domain (localhost for development)", domain_default, interactive=interactive)
-    acme_email = args.acme_email or ask("ACME contact email", email_default, interactive=interactive)
+    domain = args.domain or ask(
+        "5/6 — Domain (localhost for development)",
+        domain_default,
+        interactive=interactive,
+    )
+    acme_email = args.acme_email or ask(
+        "ACME contact email", email_default, interactive=interactive
+    )
 
     print("\n6/6 — Generating or preserving security values...")
     generated = {
@@ -183,9 +221,21 @@ def main(argv: list[str] | None = None) -> int:
     }
     env_values = {
         **existing_env,
-        "FERNET_KEY": generated["FERNET_KEY"] if args.force_secrets or not existing_env.get("FERNET_KEY") else existing_env["FERNET_KEY"],
-        "BEARER_TOKEN": generated["BEARER_TOKEN"] if args.force_secrets or not existing_env.get("BEARER_TOKEN") else existing_env["BEARER_TOKEN"],
-        "AGENTS_AUTH_TOKEN": generated["AGENTS_AUTH_TOKEN"] if args.force_secrets or not existing_env.get("AGENTS_AUTH_TOKEN") else existing_env["AGENTS_AUTH_TOKEN"],
+        "FERNET_KEY": (
+            generated["FERNET_KEY"]
+            if args.force_secrets or not existing_env.get("FERNET_KEY")
+            else existing_env["FERNET_KEY"]
+        ),
+        "BEARER_TOKEN": (
+            generated["BEARER_TOKEN"]
+            if args.force_secrets or not existing_env.get("BEARER_TOKEN")
+            else existing_env["BEARER_TOKEN"]
+        ),
+        "AGENTS_AUTH_TOKEN": (
+            generated["AGENTS_AUTH_TOKEN"]
+            if args.force_secrets or not existing_env.get("AGENTS_AUTH_TOKEN")
+            else existing_env["AGENTS_AUTH_TOKEN"]
+        ),
         "DATABASE_PATH": existing_env.get("DATABASE_PATH", "./data/aetherflow.db"),
         "HOST": existing_env.get("HOST", "127.0.0.1"),
         "PORT": existing_env.get("PORT", "8000"),
@@ -233,11 +283,24 @@ def main(argv: list[str] | None = None) -> int:
                 "max_concurrent_per_environment": 1,
                 "job_events_retention_days": 30,
             },
-            "retention": {"default_hours": 24, "on_delete_after_completion": "immediate", "delay_hours": 0},
+            "retention": {
+                "default_hours": 24,
+                "on_delete_after_completion": "immediate",
+                "delay_hours": 0,
+            },
             "agents": {"auth_token": "", "phone_host": phone_host or None},
             "environment_selection": {
-                "order": (["phone", "vps"] if tier == "local_only" and use_phone else ["vps"]
-                          if tier == "local_only" else (["phone", "vps", "cloud"] if use_phone else ["vps", "cloud"])),
+                "order": (
+                    ["phone", "vps"]
+                    if tier == "local_only" and use_phone
+                    else ["vps"]
+                    if tier == "local_only"
+                    else (
+                        ["phone", "vps", "cloud"]
+                        if use_phone
+                        else ["vps", "cloud"]
+                    )
+                ),
                 "per_job_override": True,
             },
             "integrations": {
@@ -246,7 +309,8 @@ def main(argv: list[str] | None = None) -> int:
             },
             "notes": [
                 "Secret values belong in .env; do not copy credentials into this YAML file.",
-                "Integration flags are configuration intent, not proof that runtime adapters are implemented.",
+                "Integration flags are configuration intent, "
+                "not proof that runtime adapters are implemented.",
             ],
         }
         serialized = yaml.safe_dump(config, allow_unicode=True, sort_keys=False)
@@ -264,15 +328,24 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Phone       : {'configured' if use_phone else 'disabled'}")
     print(f"  Modal       : {'enabled in config' if use_modal else 'disabled'}")
     if use_modal and (not modal_id or not modal_secret):
-        print("  WARNING     : Modal credentials are still blank; configure them in .env before use.")
+        print(
+            "  WARNING     : Modal credentials are still blank; "
+            "configure them in .env before use."
+        )
     print(f"  Telegram    : {'enabled in config' if use_telegram else 'disabled'}")
     if use_telegram and not telegram_token:
         print("  WARNING     : Telegram token is blank; configure it in .env before use.")
     print(f"  Domain      : {domain}")
     if domain == "localhost":
         print("  Development : set a real DNS name and ACME_EMAIL for public HTTPS deployment.")
-    print("  Next        : review .env, then run the test and spec-validation commands in README.md.")
-    print("  Notice      : job execution, agent communication and integrations remain scaffold work.")
+    print(
+        "  Next        : review .env, then run the test and spec-validation "
+        "commands in README.md."
+    )
+    print(
+        "  Notice      : job execution, agent communication and integrations "
+        "remain scaffold work."
+    )
     return 0
 
 
@@ -280,5 +353,8 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("\nSetup cancelled; existing secrets were not intentionally rotated.", file=sys.stderr)
-        raise SystemExit(130)
+        print(
+            "\nSetup cancelled; existing secrets were not intentionally rotated.",
+            file=sys.stderr,
+        )
+        raise SystemExit(130) from None

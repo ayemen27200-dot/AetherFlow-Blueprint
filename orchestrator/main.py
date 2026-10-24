@@ -25,6 +25,7 @@ import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -233,6 +234,27 @@ def _safe_environment(payload: dict) -> str | None:
     return value if isinstance(value, str) and value in _ALLOWED_ENVIRONMENTS else None
 
 
+def _safe_output_references(output_paths: tuple[str, ...]) -> list[str]:
+    """Return only storage-root-relative output references.
+
+    The worker writes references relative to its private output base (e.g.
+    ``<job-id>/part_000.mp4``); absolute filesystem paths must never appear in
+    an API response, as they would disclose the server's storage layout. This
+    read-side guard is defence in depth: any absolute or parent-escaping
+    entry — only reachable through a direct database edit, since the worker
+    cannot write one — is omitted rather than leaked.
+    """
+    safe: list[str] = []
+    for entry in output_paths:
+        if not isinstance(entry, str) or not entry:
+            continue
+        candidate = Path(entry)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            continue
+        safe.append(entry)
+    return safe
+
+
 def _record_to_job(record: JobRecord) -> Job:
     """Map a full queue record onto the public Job response model."""
     payload = _load_checkpoint_payload(record.checkpoint_data)
@@ -241,7 +263,7 @@ def _record_to_job(record: JobRecord) -> Job:
         status=record.status,
         type=record.type,
         created_at=_iso_timestamp(record.created_at) or record.created_at,
-        output_paths=list(record.output_paths),
+        output_paths=_safe_output_references(record.output_paths),
         environment=_safe_environment(payload),
         priority=record.priority,
         error_type=record.error_type,

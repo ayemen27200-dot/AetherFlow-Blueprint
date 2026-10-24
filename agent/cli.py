@@ -143,6 +143,7 @@ def worker_run(
         executor,
         concurrency=concurrency,
         upload_store=store,
+        output_base_dir=output_dir,
         poll_interval=poll_interval,
         max_jobs=None if max_jobs < 0 else max_jobs,
         stop_event=stop_event,

@@ -482,12 +482,7 @@ class SQLiteQueue:
         else:
             input_path = stored
             upload_id = None
-        raw_outputs = row["output_paths"]
-        if raw_outputs:
-            parsed = json.loads(raw_outputs)
-            output_paths = tuple(str(item) for item in parsed)
-        else:
-            output_paths = ()
+        output_paths = _parse_output_paths(row["output_paths"])
         return JobRecord(
             id=row["id"],
             type=row["type"],
@@ -960,6 +955,29 @@ class SQLiteQueue:
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
+
+
+def _parse_output_paths(raw: str | None) -> tuple[str, ...]:
+    """Decode the ``output_paths`` JSON column defensively.
+
+    The column is only ever written by trusted worker code via
+    ``json.dumps``, so malformed content can only come from a direct database
+    edit. Controlled degradation matches the checkpoint helper: an empty
+    value, malformed JSON, or a JSON value that is not a list yields an empty
+    tuple instead of an exception. Inside a list, only genuine strings are
+    kept — numbers, objects or ``null`` entries are never coerced into fake
+    filesystem paths. This function performs no database access, so real
+    SQLite errors are not swallowed.
+    """
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(item for item in parsed if isinstance(item, str))
 
 
 def _sql_timestamp() -> str:

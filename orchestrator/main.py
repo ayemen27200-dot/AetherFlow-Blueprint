@@ -219,6 +219,20 @@ def _load_checkpoint_payload(raw: str | None) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+# Allowed environment preference values, mirroring the JobSpec/OpenAPI enum.
+_ALLOWED_ENVIRONMENTS: frozenset[str] = frozenset({"phone", "vps", "cloud"})
+
+
+def _safe_environment(payload: dict) -> str | None:
+    """Return the checkpoint environment only when it is a valid enum value.
+
+    A missing key, a non-string value or an unknown string all degrade to
+    ``None`` rather than leaking an uncontrolled value into the Job model.
+    """
+    value = payload.get("environment")
+    return value if isinstance(value, str) and value in _ALLOWED_ENVIRONMENTS else None
+
+
 def _record_to_job(record: JobRecord) -> Job:
     """Map a full queue record onto the public Job response model."""
     payload = _load_checkpoint_payload(record.checkpoint_data)
@@ -228,7 +242,7 @@ def _record_to_job(record: JobRecord) -> Job:
         type=record.type,
         created_at=_iso_timestamp(record.created_at) or record.created_at,
         output_paths=list(record.output_paths),
-        environment=payload.get("environment"),
+        environment=_safe_environment(payload),
         priority=record.priority,
         error_type=record.error_type,
         started_at=_iso_timestamp(record.started_at),

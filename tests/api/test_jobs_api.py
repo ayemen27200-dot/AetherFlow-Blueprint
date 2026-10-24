@@ -419,3 +419,83 @@ def test_checkpoint_payload_helper_handles_every_corrupt_shape() -> None:
     }
     # Non-string defensive input must not raise either.
     assert _load_checkpoint_payload(123) == {}  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
+# Audit follow-up: corrupt output_paths and invalid environment values
+# --------------------------------------------------------------------------- #
+
+
+def _create_job_and_corrupt(client: TestClient, tmp_path, column: str, value: str) -> str:
+    created = client.post("/jobs", headers=AUTH, json=VALID_SPEC)
+    assert created.status_code == 202
+    job_id = created.json()["id"]
+    raw = sqlite3.connect(tmp_path / "api.db")
+    try:
+        raw.execute(f"UPDATE jobs SET {column} = ? WHERE id = ?", (value, job_id))
+        raw.commit()
+    finally:
+        raw.close()
+    return job_id
+
+
+@pytest.mark.parametrize(
+    "corrupt_outputs",
+    [
+        "{broken json",  # malformed JSON
+        "123",  # valid JSON number, not a list
+        '{"not":"a list"}',  # valid JSON object, not a list
+        "null",  # explicit JSON null
+        "[1, 2, 3]",  # a list with no string elements
+    ],
+)
+def test_corrupt_output_paths_never_returns_500(
+    client: TestClient, tmp_path, corrupt_outputs: str
+) -> None:
+    job_id = _create_job_and_corrupt(client, tmp_path, "output_paths", corrupt_outputs)
+
+    detail = client.get(f"/jobs/{job_id}", headers=AUTH)
+    assert detail.status_code == 200
+    assert detail.json()["output_paths"] == []
+
+    listing = client.get("/jobs", headers=AUTH)
+    assert listing.status_code == 200
+    listed = next(job for job in listing.json() if job["id"] == job_id)
+    assert listed["output_paths"] == []
+
+
+def test_valid_output_paths_still_serialize(client: TestClient, tmp_path) -> None:
+    job_id = _create_job_and_corrupt(
+        client, tmp_path, "output_paths", '["/out/a.mp4", "/out/b.mp4"]'
+    )
+    response = client.get(f"/jobs/{job_id}", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["output_paths"] == ["/out/a.mp4", "/out/b.mp4"]
+
+
+@pytest.mark.parametrize("bad_environment", ['"datacenter"', "123", "null", '["cloud"]'])
+def test_invalid_checkpoint_environment_degrades_to_none(
+    client: TestClient, tmp_path, bad_environment: str
+) -> None:
+    job_id = _create_job_and_corrupt(
+        client, tmp_path, "checkpoint_data", f'{{"environment": {bad_environment}}}'
+    )
+    response = client.get(f"/jobs/{job_id}", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["environment"] is None
+
+    listing = client.get("/jobs", headers=AUTH)
+    assert listing.status_code == 200
+    listed = next(job for job in listing.json() if job["id"] == job_id)
+    assert listed["environment"] is None
+
+
+def test_valid_checkpoint_environment_is_preserved(
+    client: TestClient, tmp_path
+) -> None:
+    job_id = _create_job_and_corrupt(
+        client, tmp_path, "checkpoint_data", '{"environment": "cloud"}'
+    )
+    response = client.get(f"/jobs/{job_id}", headers=AUTH)
+    assert response.status_code == 200
+    assert response.json()["environment"] == "cloud"

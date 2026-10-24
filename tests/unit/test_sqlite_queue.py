@@ -1043,6 +1043,56 @@ def test_fetch_job_returns_full_record_and_decodes_upload_id(
         assert record.error_type == "TOOL_ERROR"
 
 
+@pytest.mark.parametrize(
+    "corrupt_outputs",
+    [
+        "{broken json",
+        "123",
+        '{"not": "a list"}',
+        '"/out/a.mp4"',  # valid JSON string, but not a list
+        "null",
+        '["/ok.mp4", 42, null, {"x": 1}, "/also-ok.mp4"]',  # mixed element types
+    ],
+)
+def test_corrupt_output_paths_degrade_to_controlled_value(
+    tmp_path: Path, corrupt_outputs: str
+) -> None:
+    """Malformed or non-list output_paths must never raise or fabricate paths."""
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(QueuedJob(id="j1", type="split", upload_id="up-1"))
+
+    with raw_connect(tmp_path / "q.db") as conn:
+        conn.execute(
+            "UPDATE jobs SET output_paths = ? WHERE id = 'j1'",
+            (corrupt_outputs,),
+        )
+        conn.commit()
+
+    with SQLiteQueue(tmp_path / "q.db") as reopened:
+        record = reopened.fetch_job("j1")
+        assert record is not None
+        # Non-string elements inside a list are dropped, never stringified
+        # into fake filesystem paths; everything else becomes an empty tuple.
+        if corrupt_outputs.startswith('["/ok.mp4"'):
+            assert record.output_paths == ("/ok.mp4", "/also-ok.mp4")
+        else:
+            assert record.output_paths == ()
+        # list_jobs exercises the same parser and must not raise either.
+        assert len(reopened.list_jobs()) == 1
+
+
+def test_parse_output_paths_helper_contract() -> None:
+    from orchestrator.queue import _parse_output_paths
+
+    assert _parse_output_paths(None) == ()
+    assert _parse_output_paths("") == ()
+    assert _parse_output_paths("{bad") == ()
+    assert _parse_output_paths("5") == ()
+    assert _parse_output_paths('{"a": 1}') == ()
+    assert _parse_output_paths('["a.mp4"]') == ("a.mp4",)
+    assert _parse_output_paths('["a", 1, null, true, {}]') == ("a",)
+
+
 def test_list_jobs_orders_by_priority_then_creation_and_filters_status(
     tmp_path: Path,
 ) -> None:

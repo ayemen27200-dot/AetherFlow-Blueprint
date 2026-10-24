@@ -1,0 +1,44 @@
+name: Import AetherFlow Blueprint ZIP
+
+on:
+  push:
+    paths:
+      - "aetherflow-blueprint-v1.2.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  import-blueprint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate and extract package
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -t aetherflow-blueprint-v1.2.zip
+          mkdir -p /tmp/aetherflow-import
+          unzip -q aetherflow-blueprint-v1.2.zip -d /tmp/aetherflow-import
+          test -d /tmp/aetherflow-import/aetherflow-blueprint
+          cp -a /tmp/aetherflow-import/aetherflow-blueprint/. .
+          rm -f aetherflow-blueprint-v1.2.zip
+          rm -rf /tmp/aetherflow-import
+
+      - name: Commit imported source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No imported files to commit."
+            exit 0
+          fi
+          git commit -m "Import AetherFlow Blueprint v1.2 source tree"
+          git push origin HEAD:main

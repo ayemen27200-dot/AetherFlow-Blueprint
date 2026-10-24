@@ -3,7 +3,7 @@ name: Import AetherFlow Blueprint ZIP
 on:
   push:
     paths:
-      - ".bootstrap/READY"
+      - "aetherflow-blueprint-v1.2.zip"
 
 permissions:
   contents: write
@@ -17,19 +17,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Rebuild, validate, and extract package
+      - name: Validate and extract package
         shell: bash
         run: |
           set -euo pipefail
-          cat .bootstrap/part* > /tmp/aetherflow-blueprint-v1.2.zip.b64
-          base64 --decode /tmp/aetherflow-blueprint-v1.2.zip.b64 > /tmp/aetherflow-blueprint-v1.2.zip
-          unzip -t /tmp/aetherflow-blueprint-v1.2.zip
+          unzip -t aetherflow-blueprint-v1.2.zip
           mkdir -p /tmp/aetherflow-import
-          unzip -q /tmp/aetherflow-blueprint-v1.2.zip -d /tmp/aetherflow-import
+          unzip -q aetherflow-blueprint-v1.2.zip -d /tmp/aetherflow-import
           test -d /tmp/aetherflow-import/aetherflow-blueprint
           cp -a /tmp/aetherflow-import/aetherflow-blueprint/. .
-          rm -rf .bootstrap /tmp/aetherflow-import
-          rm -f /tmp/aetherflow-blueprint-v1.2.zip /tmp/aetherflow-blueprint-v1.2.zip.b64
+          rm -f aetherflow-blueprint-v1.2.zip
+          rm -rf /tmp/aetherflow-import
 
       - name: Commit imported source tree
         shell: bash

@@ -320,15 +320,40 @@ class FFmpegSplitExecutor(Executor):
 
     # ------------------------------------------------------------------ probe
     def probe(self, path: Path) -> MediaInfo:
-        """Return validated media metadata, using ffprobe or an FFmpeg fallback."""
-        if self.ffprobe_cmd:
-            info = self._probe_with_ffprobe(path)
-            if info is not None:
-                return info
-        info = self._probe_with_ffmpeg(path)
+        """Read metadata and verify the complete media stream can be decoded."""
+        info = self._probe_with_ffprobe(path) if self.ffprobe_cmd else None
         if info is None:
+            info = self._probe_with_ffmpeg(path)
+        if info is None or not self._decode_media(path):
             raise ExecutorInputError("input media could not be validated")
-        return info
+        return MediaInfo(duration_sec=info.duration_sec, decodable=True)
+
+    def _decode_media(self, path: Path) -> bool:
+        """Decode the complete media stream with a bounded FFmpeg subprocess."""
+        if not self.ffmpeg_cmd:
+            return False
+        try:
+            completed = subprocess.run(
+                [
+                    self.ffmpeg_cmd,
+                    "-hide_banner",
+                    "-nostdin",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(path),
+                    "-f",
+                    "null",
+                    "-",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.probe_timeout_sec,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return completed.returncode == 0
 
     def _probe_with_ffprobe(self, path: Path) -> MediaInfo | None:
         try:
@@ -553,7 +578,10 @@ class FFmpegSplitExecutor(Executor):
         for part in parts:
             if not part.is_file() or part.stat().st_size == 0:
                 raise ExecutorToolError("an output part is missing or empty")
-            info = self.probe(part)
+            try:
+                info = self.probe(part)
+            except ExecutorInputError as exc:
+                raise ExecutorToolError("an output part failed media validation") from exc
             if not info.decodable:
                 raise ExecutorToolError("an output part failed media validation")
             outputs.append(str(part))

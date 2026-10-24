@@ -122,7 +122,10 @@ _DEFAULT_MAX_RETRIES = 3
 # with this prefix and never handed to filesystem APIs.
 _UPLOAD_PREFIX = "upload://"
 # Opaque server-issued ids are bounded tokens with no path semantics: no
-# separators, no parent references, no NUL characters.
+# separators, no parent references, no NUL characters. The OpenAPI contract
+# types ``upload_id`` as a plain string without a documented issuer pattern
+# (POST /uploads is not implemented yet), so this is a conservative queue-side
+# token bound rather than a guess at the future issuer format.
 _UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
@@ -276,12 +279,24 @@ def validate_upload_id(upload_id: str) -> str:
     Upload ids are server-issued tokens (see ``POST /uploads`` in the OpenAPI
     contract), never paths. Path separators, parent references and control
     characters are rejected so an id can never be reinterpreted as a local
-    filesystem location.
+    filesystem location. The filesystem special names ``.`` and ``..`` — and
+    every dot-only string — are rejected explicitly even though the charset
+    regex would otherwise admit them.
+
+    This is a syntax/shape check only. It does not prove that the id exists or
+    that the caller owns it; the future upload-store integration must verify
+    existence/ownership against ``POST /uploads`` state instead of deriving a
+    filesystem path from the id.
     """
     if not isinstance(upload_id, str) or not _UPLOAD_ID_RE.fullmatch(upload_id):
         raise InvalidUploadIdError(
             "upload id must be 1-128 characters from [A-Za-z0-9._-] with no "
             "path separators or parent references"
+        )
+    if upload_id.strip(".") == "":
+        raise InvalidUploadIdError(
+            "upload id must not be '.' or '..' or consist solely of dots; "
+            "filesystem special names are not valid opaque upload ids"
         )
     return upload_id
 

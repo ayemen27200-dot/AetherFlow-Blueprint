@@ -401,11 +401,71 @@ def test_upload_id_is_accepted_without_policy_and_never_hits_filesystem(
 
 
 def test_upload_id_rejects_path_like_or_malformed_tokens() -> None:
-    for bad in ("", "a/b", "../etc/passwd", "a\\b", "up#1", "x" * 129, "a b"):
+    for bad in (
+        "",
+        "a/b",
+        "../etc/passwd",
+        "a\\b",
+        "up#1",
+        "x" * 129,
+        "a b",
+        # Filesystem special names: dot-only strings must not pass even though
+        # every character belongs to the allowed token charset.
+        ".",
+        "..",
+        "...",
+        "." * 16,
+        "." * 128,
+    ):
         with pytest.raises(InvalidUploadIdError):
             validate_upload_id(bad)
     for good in ("up-1", "abc123", "UPLOAD.123_x-1"):
         assert validate_upload_id(good) == good
+
+
+def test_upload_id_allowed_charset_and_length_bounds() -> None:
+    # Positive cases: every documented allowed character class, single char,
+    # dots in non-special positions, and the inclusive 128-char upper bound.
+    accepted = (
+        "a",
+        "A",
+        "1",
+        "up-123_ABC.42",
+        "a.b-c_d",
+        "a..b",
+        ".lead",
+        "trail.",
+        "x" * 128,
+    )
+    for token in accepted:
+        assert validate_upload_id(token) == token
+        assert len(token) <= 128
+    # Anything past 128 characters is malformed regardless of charset.
+    with pytest.raises(InvalidUploadIdError):
+        validate_upload_id("x" * 129)
+    # Non-string types are rejected rather than coerced.
+    for bad in (None, 123, b"up-1"):
+        with pytest.raises(InvalidUploadIdError):
+            validate_upload_id(bad)
+
+
+def test_dot_only_upload_id_is_rejected_at_enqueue_without_a_database_row(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        for bad in (".", "..", "...", "." * 8):
+            with pytest.raises(InvalidUploadIdError):
+                queue.enqueue(QueuedJob(id=f"j-{bad}", type="split", upload_id=bad))
+        assert queue.size() == 0
+
+    # Row-level proof: validation runs before any INSERT, so the rejected
+    # tokens never reach the jobs table (not even under the upload:// prefix).
+    with raw_connect(db_path) as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        stored = conn.execute("SELECT input_path FROM jobs").fetchall()
+    assert rows == 0
+    assert stored == []
 
 
 def test_input_path_and_upload_id_are_mutually_exclusive(tmp_path: Path) -> None:

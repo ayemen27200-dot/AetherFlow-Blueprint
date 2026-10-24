@@ -210,10 +210,12 @@ def test_decode_media_distinguishes_good_from_header_intact_corrupt(
     executor = _make_executor(tmp_path)
 
     # Premise of the regression: duration metadata remains readable on both
-    # files, so metadata alone cannot tell them apart.
+    # files, so metadata alone cannot tell them apart. Mirror probe()'s own
+    # ffprobe -> ffmpeg fallback when resolving the metadata.
+    corrupt_metadata = None
     if executor.ffprobe_cmd:
         corrupt_metadata = executor._probe_with_ffprobe(corrupt)
-    else:
+    if corrupt_metadata is None:
         corrupt_metadata = executor._probe_with_ffmpeg(corrupt)
     assert corrupt_metadata is not None and corrupt_metadata.duration_sec > 0
 

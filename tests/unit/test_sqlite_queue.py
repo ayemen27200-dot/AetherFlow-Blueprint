@@ -1,7 +1,7 @@
 """Unit tests for the durable SQLite queue (D2 contract).
 
-Every test uses an isolated temporary database; no production data, network
-access or paid resources are involved.
+Every test uses an isolated temporary database and synthetic temporary files;
+no production data, network access or paid resources are involved.
 """
 
 from __future__ import annotations
@@ -13,14 +13,22 @@ from pathlib import Path
 import pytest
 
 from orchestrator.queue import (
+    EnqueuePolicy,
+    InvalidJobStateError,
     JobAlreadyExistsError,
+    JobInputNotFoundError,
+    JobInputPathNotAllowedError,
+    JobInputTooLargeError,
+    JobInputTypeNotAllowedError,
     JobNotFoundError,
     QueuedJob,
     SQLiteQueue,
+    validate_job_input,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CANONICAL_SCHEMA = REPO_ROOT / "D1_FOUNDATION" / "02_DB_SCHEMA.sql"
+TRANSFER_SPEC = REPO_ROOT / "config" / "file_transfer_spec.yaml"
 
 
 def make_job(
@@ -29,9 +37,14 @@ def make_job(
     priority: int = 5,
     job_type: str = "split",
     created_at: str = "",
+    input_path: str | None = None,
 ) -> QueuedJob:
     return QueuedJob(
-        id=job_id, type=job_type, priority=priority, created_at=created_at
+        id=job_id,
+        type=job_type,
+        priority=priority,
+        created_at=created_at,
+        input_path=input_path,
     )
 
 
@@ -39,6 +52,14 @@ def raw_connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def make_policy(base_dir: Path, *, max_bytes: int = 1024) -> EnqueuePolicy:
+    return EnqueuePolicy(
+        max_file_size_bytes=max_bytes,
+        allowed_extensions=frozenset({".mp4", ".wav"}),
+        allowed_base_dir=base_dir,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +77,7 @@ def test_enqueue_makes_job_visible_as_queued(tmp_path: Path) -> None:
         stored = queue.get("j1")
         assert stored is not None
         assert stored.id == "j1"
+        assert stored.attempt == 0
         # created_at is stamped by the database when not supplied.
         assert stored.created_at != ""
 
@@ -74,6 +96,7 @@ def test_dequeue_claims_atomically_and_marks_assigned(tmp_path: Path) -> None:
 
         assert claimed is not None
         assert claimed.id == "j1"
+        assert claimed.attempt == 0
         assert queue.size() == 0
         assert queue.get_status("j1") == "assigned"
         # No queued job remains, so the next claim is empty.
@@ -158,7 +181,7 @@ def test_enqueue_validates_arguments(tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="priority"):
             queue.enqueue(make_job("j", priority=11))
         with pytest.raises(TypeError):
-            queue.enqueue("not-a-job")  # type: ignore[arg-type]]
+            queue.enqueue("not-a-job")  # type: ignore[arg-type]
 
 
 def test_database_check_constraint_rejects_out_of_range_priority(tmp_path: Path) -> None:
@@ -173,24 +196,147 @@ def test_database_check_constraint_rejects_out_of_range_priority(tmp_path: Path)
             )
 
 
-def test_lifecycle_transitions_and_unknown_job_errors(tmp_path: Path) -> None:
+# --------------------------------------------------------------------------- #
+# Enqueue input policy (file/path/size validation)
+# --------------------------------------------------------------------------- #
+
+
+def test_policy_loads_project_limits_from_transfer_spec() -> None:
+    policy = EnqueuePolicy.from_file_transfer_spec(TRANSFER_SPEC)
+    assert policy.max_file_size_bytes == 2000 * 1024 * 1024
+    assert policy.allowed_extensions == frozenset(
+        {".mp4", ".mkv", ".mov", ".mp3", ".wav", ".m4a"}
+    )
+    # The project defines no trusted input directory yet; containment cannot
+    # be claimed as enforced until that setting exists.
+    assert policy.allowed_base_dir is None
+
+
+def test_enqueue_accepts_valid_file_inside_trusted_dir(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    media = incoming / "clip.mp4"
+    media.write_bytes(b"synthetic-bytes")
+    policy = make_policy(incoming)
+
+    with SQLiteQueue(tmp_path / "q.db", enqueue_policy=policy) as queue:
+        queue.enqueue(make_job("j1", input_path=str(media)))
+        assert queue.get_status("j1") == "queued"
+
+
+def test_enqueue_rejects_missing_file(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    policy = make_policy(incoming)
+
+    with SQLiteQueue(tmp_path / "q.db", enqueue_policy=policy) as queue:
+        missing = incoming / "ghost.mp4"
+        with pytest.raises(JobInputNotFoundError):
+            queue.enqueue(make_job("j1", input_path=str(missing)))
+        assert queue.size() == 0
+
+
+def test_enqueue_rejects_path_outside_trusted_dir(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    outside_dir = tmp_path / "elsewhere"
+    outside_dir.mkdir()
+    outside = outside_dir / "clip.mp4"
+    outside.write_bytes(b"x")
+    policy = make_policy(incoming)
+
+    with SQLiteQueue(tmp_path / "q.db", enqueue_policy=policy) as queue:
+        with pytest.raises(JobInputPathNotAllowedError):
+            queue.enqueue(make_job("j1", input_path=str(outside)))
+
+        # Path traversal must resolve and be rejected identically.
+        traversal = incoming / "subdir" / ".." / ".." / "elsewhere" / "clip.mp4"
+        with pytest.raises(JobInputPathNotAllowedError):
+            validate_job_input(traversal, policy)
+        assert queue.size() == 0
+
+
+def test_enqueue_rejects_disallowed_extension(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    document = incoming / "notes.txt"
+    document.write_text("not media")
+    policy = make_policy(incoming)
+
+    with SQLiteQueue(tmp_path / "q.db", enqueue_policy=policy) as queue:
+        with pytest.raises(JobInputTypeNotAllowedError):
+            queue.enqueue(make_job("j1", input_path=str(document)))
+        assert queue.size() == 0
+
+
+def test_enqueue_rejects_oversized_file_before_insert(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    big = incoming / "big.mp4"
+    big.write_bytes(b"x" * 50)
+    policy = make_policy(incoming, max_bytes=20)
+
+    with SQLiteQueue(tmp_path / "q.db", enqueue_policy=policy) as queue:
+        with pytest.raises(JobInputTooLargeError):
+            queue.enqueue(make_job("j1", input_path=str(big)))
+        assert queue.size() == 0
+
+
+def test_policy_without_base_dir_still_enforces_existence_type_size(
+    tmp_path: Path,
+) -> None:
+    # Documented gap mode: no trusted dir is configured, so containment is
+    # not checkable; the other static checks must still run.
+    policy = EnqueuePolicy(
+        max_file_size_bytes=10,
+        allowed_extensions=frozenset({".mp4"}),
+        allowed_base_dir=None,
+    )
+    anywhere = tmp_path / "anywhere.mp4"
+    anywhere.write_bytes(b"12345")
+    assert validate_job_input(anywhere, policy) == anywhere.resolve()
+
+    oversized = tmp_path / "big.mp4"
+    oversized.write_bytes(b"x" * 11)
+    with pytest.raises(JobInputTooLargeError):
+        validate_job_input(oversized, policy)
+
+
+def test_enqueue_without_policy_keeps_backward_compatible_behaviour(
+    tmp_path: Path,
+) -> None:
+    # Queues without an injected policy (e.g. opaque upload-id jobs) behave
+    # exactly as before; filesystem validation is opt-in via configuration.
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(make_job("j1", input_path=None))
+        queue.enqueue(make_job("j2", input_path="/nonexistent/local/path.mp4"))
+        assert queue.size() == 2
+
+
+# --------------------------------------------------------------------------- #
+# Guarded state transitions and fencing
+# --------------------------------------------------------------------------- #
+
+
+def test_lifecycle_transitions_require_claim_generation(tmp_path: Path) -> None:
     with SQLiteQueue(tmp_path / "q.db") as queue:
         queue.enqueue(make_job("j1"))
         job = queue.dequeue()
         assert job is not None
 
-        queue.mark_processing("j1")
+        queue.mark_processing("j1", generation=job.attempt)
         assert queue.get_status("j1") == "processing"
-        queue.mark_failed("j1", error_type="TOOL_ERROR")
+        queue.mark_failed("j1", generation=job.attempt, error_type="TOOL_ERROR")
         assert queue.get_status("j1") == "failed"
 
         queue.enqueue(make_job("j2"))
-        queue.dequeue()
-        queue.mark_completed("j2")
+        claimed = queue.dequeue()
+        assert claimed is not None
+        queue.mark_completed("j2", generation=claimed.attempt)
         assert queue.get_status("j2") == "completed"
 
         with pytest.raises(JobNotFoundError):
-            queue.mark_completed("missing")
+            queue.mark_completed("missing", generation=0)
 
     with raw_connect(tmp_path / "q.db") as conn:
         failed = conn.execute(
@@ -203,62 +349,176 @@ def test_lifecycle_transitions_and_unknown_job_errors(tmp_path: Path) -> None:
         assert completed["completed_at"] is not None
 
 
+def test_transitions_are_rejected_from_illegal_states(tmp_path: Path) -> None:
+    with SQLiteQueue(tmp_path / "q1.db") as queue:
+        queue.enqueue(make_job("never_claimed"))
+        # A queued job cannot be marked processing without a claim.
+        with pytest.raises(InvalidJobStateError):
+            queue.mark_processing("never_claimed", generation=0)
+
+    with SQLiteQueue(tmp_path / "q2.db") as queue:
+        queue.enqueue(make_job("j"))
+        claimed = queue.dequeue()
+        assert claimed is not None
+        assert claimed.id == "j"
+        queue.mark_completed("j", generation=claimed.attempt)
+        # Terminal states are immutable.
+        with pytest.raises(InvalidJobStateError):
+            queue.mark_completed("j", generation=claimed.attempt)
+        with pytest.raises(InvalidJobStateError):
+            queue.mark_failed("j", generation=claimed.attempt)
+        assert queue.get_status("j") == "completed"
+
+
+def test_stale_generation_cannot_drive_transitions(tmp_path: Path) -> None:
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(make_job("j1"))
+        first = queue.dequeue()
+        assert first is not None
+        queue.mark_processing("j1", generation=first.attempt)
+
+        # Supervisor evidence: the original worker is dead.
+        recovered = queue.recover_claimed_jobs(["j1"], reason="worker process exited")
+        assert recovered == 1
+        second = queue.dequeue()
+        assert second is not None
+        assert second.attempt == first.attempt + 1
+        queue.mark_processing("j1", generation=second.attempt)
+
+        # The old worker waking up must not overwrite the new claim.
+        with pytest.raises(InvalidJobStateError):
+            queue.mark_completed("j1", generation=first.attempt)
+        with pytest.raises(InvalidJobStateError):
+            queue.mark_failed("j1", generation=first.attempt)
+        assert queue.get_status("j1") == "processing"
+
+        # The current worker still owns the job and can finish it.
+        queue.mark_completed("j1", generation=second.attempt)
+        assert queue.get_status("j1") == "completed"
+
+    with raw_connect(tmp_path / "q.db") as conn:
+        row = conn.execute(
+            "SELECT status, retry_count, completed_at FROM jobs WHERE id = 'j1'"
+        ).fetchone()
+        assert row["status"] == "completed"
+        assert row["retry_count"] == 1
+        assert row["completed_at"] is not None
+
+
 # --------------------------------------------------------------------------- #
-# Crash recovery
+# Evidence-driven crash recovery
 # --------------------------------------------------------------------------- #
 
 
-def test_recover_stalled_requeues_and_then_fails(tmp_path: Path) -> None:
+def test_recover_claimed_jobs_requeues_with_audit_event(tmp_path: Path) -> None:
     db_path = tmp_path / "q.db"
     with SQLiteQueue(db_path) as queue:
-        for job_id in ("j_retry", "j_old_retry", "j_recent", "j_exhausted"):
-            queue.enqueue(make_job(job_id))
-            queue.dequeue()
-            queue.mark_processing(job_id)
+        queue.enqueue(make_job("j1"))
+        claimed = queue.dequeue()
+        assert claimed is not None
+        queue.mark_processing("j1", generation=claimed.attempt)
 
+        recovered = queue.recover_claimed_jobs(
+            ["j1"], reason="heartbeat lost: environment offline"
+        )
+        assert recovered == 1
+        assert queue.get_status("j1") == "queued"
+
+    with raw_connect(db_path) as conn:
+        job = conn.execute(
+            "SELECT retry_count, started_at FROM jobs WHERE id = 'j1'"
+        ).fetchone()
+        assert job["retry_count"] == 1
+        assert job["started_at"] is None
+        event = conn.execute(
+            "SELECT event_type, payload_json FROM job_events WHERE job_id = 'j1'"
+        ).fetchone()
+        assert event["event_type"] == "job_requeued"
+        assert "heartbeat lost" in event["payload_json"]
+
+
+def test_recover_fails_job_after_retry_budget_exhausted(tmp_path: Path) -> None:
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        queue.enqueue(make_job("j_exhausted"))
+        claimed = queue.dequeue()
+        assert claimed is not None
+        queue.mark_processing("j_exhausted", generation=claimed.attempt)
         with raw_connect(db_path) as conn:
-            # Three jobs have been stalled for more than 90 seconds; one is fresh.
-            conn.execute(
-                """
-                UPDATE jobs
-                SET started_at = datetime('now', '-120 seconds')
-                WHERE id IN ('j_retry', 'j_old_retry', 'j_exhausted')
-                """
-            )
-            # One job already exhausted its retry budget.
             conn.execute(
                 "UPDATE jobs SET retry_count = 3 WHERE id = 'j_exhausted'"
             )
             conn.commit()
 
-        recovered = queue.recover_stalled()
-        assert recovered == 3
-
-        assert queue.get_status("j_retry") == "queued"
-        assert queue.get_status("j_old_retry") == "queued"
-        assert queue.get_status("j_recent") == "processing"
+        recovered = queue.recover_claimed_jobs(
+            ["j_exhausted"], reason="worker OOM kill confirmed"
+        )
+        assert recovered == 1
         assert queue.get_status("j_exhausted") == "failed"
 
-        with raw_connect(db_path) as conn:
-            retries = {
-                row["id"]: row["retry_count"]
-                for row in conn.execute(
-                    "SELECT id, retry_count FROM jobs"
-                ).fetchall()
-            }
-        assert retries["j_retry"] == 1
-        assert retries["j_exhausted"] == 4
+    with raw_connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT retry_count FROM jobs WHERE id = 'j_exhausted'"
+        ).fetchone()
+        assert row["retry_count"] == 4
+        event = conn.execute(
+            "SELECT event_type FROM job_events WHERE job_id = 'j_exhausted'"
+        ).fetchone()
+        assert event["event_type"] == "job_failed"
 
-        # Requeued jobs are claimable again and keep their identity.
+
+def test_recover_ignores_unclaimed_and_unknown_jobs(tmp_path: Path) -> None:
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(make_job("queued_only"))
+        queue.enqueue(make_job("claimed"))
         claimed = queue.dequeue()
         assert claimed is not None
-        assert claimed.id in {"j_retry", "j_old_retry"}
+
+        # A job that was never claimed is not stalled and stays untouched.
+        recovered = queue.recover_claimed_jobs(
+            ["queued_only", "claimed"], reason="supervisor restart"
+        )
+        assert recovered == 1
+        assert queue.get_status("queued_only") == "queued"
+        assert queue.get_status("claimed") == "queued"
+
+        # Re-recovering the now-queued job is a safe no-op: nothing claimed,
+        # no rows changed, no events written.
+        assert (
+            queue.recover_claimed_jobs(["queued_only"], reason="duplicate call")
+            == 0
+        )
+        assert queue.get_status("queued_only") == "queued"
+
+        with pytest.raises(JobNotFoundError):
+            queue.recover_claimed_jobs(["ghost"], reason="no evidence")
+        with pytest.raises(ValueError, match="reason"):
+            queue.recover_claimed_jobs(["claimed"], reason="   ")
+        with pytest.raises(ValueError, match="empty"):
+            queue.recover_claimed_jobs([], reason="nothing")
 
 
-def test_recover_stalled_validates_arguments(tmp_path: Path) -> None:
-    with SQLiteQueue(tmp_path / "q.db") as queue:
-        with pytest.raises(ValueError, match="non-negative"):
-            queue.recover_stalled(stall_seconds=-1)
+def test_no_automatic_time_based_rescheduling_exists(tmp_path: Path) -> None:
+    # Regression guard for the audit finding: the queue must expose no method
+    # that requeues a job purely because started_at grew old.
+    assert not hasattr(SQLiteQueue, "recover_stalled")
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        queue.enqueue(make_job("old_job"))
+        claimed = queue.dequeue()
+        assert claimed is not None
+        queue.mark_processing("old_job", generation=claimed.attempt)
+
+    # Even an ancient started_at must not move the job on its own.
+    with raw_connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET started_at = datetime('now', '-1 day') "
+            "WHERE id = 'old_job'"
+        )
+        conn.commit()
+    with SQLiteQueue(db_path) as restarted:
+        assert restarted.get_status("old_job") == "processing"
+        assert restarted.size() == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -338,11 +598,14 @@ def test_embedded_schema_matches_canonical_definition(tmp_path: Path) -> None:
     with SQLiteQueue(tmp_path / "q.db") as queue:
         embedded = queue._conn  # noqa: SLF001 - white-box schema comparison
 
-        canonical_cols = canonical.execute("PRAGMA table_info(jobs)").fetchall()
-        embedded_cols = embedded.execute("PRAGMA table_info(jobs)").fetchall()
-        assert [tuple(row) for row in embedded_cols] == [
-            tuple(row) for row in canonical_cols
-        ]
+        for table in ("jobs", "job_events"):
+            canonical_cols = canonical.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+            embedded_cols = embedded.execute(f"PRAGMA table_info({table})").fetchall()
+            assert [tuple(row) for row in embedded_cols] == [
+                tuple(row) for row in canonical_cols
+            ]
 
         canonical_indexes = canonical.execute(
             """
@@ -362,8 +625,10 @@ def test_embedded_schema_matches_canonical_definition(tmp_path: Path) -> None:
             tuple(row) for row in canonical_indexes
         ]
 
-        # The jobs table foreign key needs its referenced parent table.
-        assert embedded.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='environments'"
-        ).fetchone() is not None
+        # Referenced parent tables must exist.
+        for table in ("environments", "job_events"):
+            assert embedded.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,),
+            ).fetchone() is not None
     canonical.close()

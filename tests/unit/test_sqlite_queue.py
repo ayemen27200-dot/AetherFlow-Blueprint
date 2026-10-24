@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -985,6 +986,148 @@ def test_recovery_has_no_automatic_call_site() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# API read models: checkpoint persistence, fetch_job and list_jobs
+# --------------------------------------------------------------------------- #
+
+
+def test_checkpoint_data_round_trips_through_enqueue_dequeue_and_get(
+    tmp_path: Path,
+) -> None:
+    payload = '{"language":"ar","preset":"fast"}'
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(
+            QueuedJob(
+                id="j1",
+                type="split",
+                upload_id="up-1",
+                checkpoint_data=payload,
+            )
+        )
+        claimed = queue.dequeue()
+        assert claimed is not None
+        assert claimed.checkpoint_data == payload
+        fetched = queue.get("j1")
+        assert fetched is not None
+        assert fetched.checkpoint_data == payload
+
+
+def test_fetch_job_returns_full_record_and_decodes_upload_id(
+    tmp_path: Path,
+) -> None:
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(QueuedJob(id="j1", type="split", upload_id="up-42"))
+        assert queue.fetch_job("ghost") is None
+
+        record = queue.fetch_job("j1")
+        assert record is not None
+        assert record.id == "j1"
+        assert record.status == "queued"
+        assert record.upload_id == "up-42"
+        assert record.input_path is None
+        assert record.output_paths == ()
+        assert record.retry_count == 0
+        assert record.started_at is None
+        assert record.created_at
+
+    # Output paths and error type stored by a later worker stage parse back.
+    with raw_connect(tmp_path / "q.db") as conn:
+        conn.execute(
+            "UPDATE jobs SET output_paths = ?, error_type = ? WHERE id = 'j1'",
+            ('["/out/a.mp4", "/out/b.mp4"]', "TOOL_ERROR"),
+        )
+        conn.commit()
+    with SQLiteQueue(tmp_path / "q.db") as reopened:
+        record = reopened.fetch_job("j1")
+        assert record is not None
+        assert record.output_paths == ("/out/a.mp4", "/out/b.mp4")
+        assert record.error_type == "TOOL_ERROR"
+
+
+@pytest.mark.parametrize(
+    "corrupt_outputs",
+    [
+        "{broken json",
+        "123",
+        '{"not": "a list"}',
+        '"/out/a.mp4"',  # valid JSON string, but not a list
+        "null",
+        '["/ok.mp4", 42, null, {"x": 1}, "/also-ok.mp4"]',  # mixed element types
+    ],
+)
+def test_corrupt_output_paths_degrade_to_controlled_value(
+    tmp_path: Path, corrupt_outputs: str
+) -> None:
+    """Malformed or non-list output_paths must never raise or fabricate paths."""
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(QueuedJob(id="j1", type="split", upload_id="up-1"))
+
+    with raw_connect(tmp_path / "q.db") as conn:
+        conn.execute(
+            "UPDATE jobs SET output_paths = ? WHERE id = 'j1'",
+            (corrupt_outputs,),
+        )
+        conn.commit()
+
+    with SQLiteQueue(tmp_path / "q.db") as reopened:
+        record = reopened.fetch_job("j1")
+        assert record is not None
+        # Non-string elements inside a list are dropped, never stringified
+        # into fake filesystem paths; everything else becomes an empty tuple.
+        if corrupt_outputs.startswith('["/ok.mp4"'):
+            assert record.output_paths == ("/ok.mp4", "/also-ok.mp4")
+        else:
+            assert record.output_paths == ()
+        # list_jobs exercises the same parser and must not raise either.
+        assert len(reopened.list_jobs()) == 1
+
+
+def test_parse_output_paths_helper_contract() -> None:
+    from orchestrator.queue import _parse_output_paths
+
+    assert _parse_output_paths(None) == ()
+    assert _parse_output_paths("") == ()
+    assert _parse_output_paths("{bad") == ()
+    assert _parse_output_paths("5") == ()
+    assert _parse_output_paths('{"a": 1}') == ()
+    assert _parse_output_paths('["a.mp4"]') == ("a.mp4",)
+    assert _parse_output_paths('["a", 1, null, true, {}]') == ("a",)
+
+
+def test_list_jobs_orders_by_priority_then_creation_and_filters_status(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        # Same-second inserts; created_at ties are broken by insertion order.
+        queue.enqueue(make_job("low", priority=1, created_at="2026-01-01 00:00:00"))
+        queue.enqueue(make_job("high", priority=9, created_at="2026-01-01 00:00:00"))
+        queue.enqueue(make_job("mid", priority=5, created_at="2026-01-01 00:00:00"))
+        queue.enqueue(make_job("early_high", priority=9, created_at="2025-12-31 00:00:00"))
+
+        ordered = [record.id for record in queue.list_jobs()]
+        assert ordered == ["early_high", "high", "mid", "low"]
+
+        limited = [record.id for record in queue.list_jobs(limit=2)]
+        assert limited == ["early_high", "high"]
+
+        queued_ids = [
+            record.id for record in queue.list_jobs(status="queued", limit=10)
+        ]
+        assert queued_ids == ordered
+
+        # Claim one row; the status filter then excludes it.
+        claimed = queue.dequeue()
+        assert claimed is not None
+        assert queue.list_jobs(status="assigned")[0].id == claimed.id
+        assert all(record.status == "assigned" for record in queue.list_jobs(status="assigned"))
+        assert len(queue.list_jobs(status="queued")) == 3
+
+        for bad_limit in (0, -1, True, "5"):
+            with pytest.raises(ValueError, match="limit"):
+                queue.list_jobs(limit=bad_limit)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
 # Concurrency and locking
 # --------------------------------------------------------------------------- #
 
@@ -1024,6 +1167,108 @@ def test_concurrent_workers_claim_each_job_exactly_once(tmp_path: Path) -> None:
     with SQLiteQueue(db_path) as queue:
         assert queue.size() == 0
         assert queue.count("assigned") == len(job_ids)
+
+
+def test_shared_queue_instance_is_safe_under_concurrent_enqueue_and_reads(
+    tmp_path: Path,
+) -> None:
+    """Regression test for the shared-connection audit finding.
+
+    One single SQLiteQueue object is hammered from a thread pool with
+    concurrent writes (enqueue) and reads (list_jobs/fetch_job/size/count/
+    get_status). The explicit RLock must keep every BEGIN IMMEDIATE
+    transaction indivisible and every read consistent: no sqlite threading or
+    transaction errors, and final row/request counts must match exactly.
+    """
+    db_path = tmp_path / "shared.db"
+    writer_threads = 8
+    per_thread = 25
+    expected_total = writer_threads * per_thread
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def record(exc: BaseException) -> None:  # pragma: no cover - surfaced below
+        with errors_lock:
+            errors.append(exc)
+
+    with SQLiteQueue(db_path) as shared:
+        def producer(worker_index: int) -> None:
+            try:
+                for index in range(per_thread):
+                    job_id = f"w{worker_index:02d}-j{index:03d}"
+                    shared.enqueue(
+                        QueuedJob(
+                            id=job_id,
+                            type="split",
+                            upload_id=f"up-{worker_index}-{index}",
+                            priority=index % 11,
+                        )
+                    )
+                    # Read traffic interleaved with the writes on the same object.
+                    assert shared.size() >= 0
+                    listing = shared.list_jobs(limit=10)
+                    assert len(listing) <= 10
+                    assert shared.count("queued") >= 0
+                    assert shared.get_status(job_id) == "queued"
+                    fetched = shared.fetch_job(job_id)
+                    assert fetched is not None and fetched.id == job_id
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                record(exc)
+
+        def reader() -> None:
+            try:
+                for _ in range(100):
+                    shared.list_jobs(limit=50)
+                    shared.count()
+                    shared.fetch_job("w00-j000")
+                    shared.get_status("w07-j024")
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                record(exc)
+
+        with ThreadPoolExecutor(max_workers=writer_threads + 4) as pool:
+            producer_futures = [
+                pool.submit(producer, worker_index)
+                for worker_index in range(writer_threads)
+            ]
+            reader_futures = [pool.submit(reader) for _ in range(4)]
+            for future in [*producer_futures, *reader_futures]:
+                future.result(timeout=60)
+
+        assert errors == []
+        assert shared.count() == expected_total
+        assert shared.size() == expected_total
+        # Every submitted job exists exactly once and is still queued.
+        all_rows = shared.list_jobs(limit=expected_total)
+        assert len(all_rows) == expected_total
+        assert len({row.id for row in all_rows}) == expected_total
+        assert all(row.status == "queued" for row in all_rows)
+
+        # Second wave: concurrent dequeue on the SAME shared instance must
+        # claim every job exactly once without transaction errors.
+        claimed: list[str] = []
+        claim_lock = threading.Lock()
+
+        def claimer() -> None:
+            try:
+                while True:
+                    job = shared.dequeue()
+                    if job is None:
+                        return
+                    with claim_lock:
+                        claimed.append(job.id)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                record(exc)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            claim_futures = [pool.submit(claimer) for _ in range(8)]
+            for future in claim_futures:
+                future.result(timeout=60)
+
+        assert errors == []
+        assert len(claimed) == expected_total
+        assert len(set(claimed)) == expected_total
+        assert shared.size() == 0
+        assert shared.count("assigned") == expected_total
 
 
 def test_busy_timeout_raises_when_write_lock_is_held(tmp_path: Path) -> None:

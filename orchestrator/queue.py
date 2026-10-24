@@ -53,8 +53,14 @@ paths: they carry an opaque ``QueuedJob.upload_id`` (the ``POST /uploads``
 contract in ``D2_MVP/02_IMPLEMENTATION_MAP.md``) which is token-validated and
 never passed to filesystem APIs.
 
-Each worker/thread should open its own ``SQLiteQueue`` instance; the wrapped
-sqlite3 connection is not shared across threads by design.
+Worker threads that need full isolation should open their own
+``SQLiteQueue`` instance. A single instance may also be shared across the
+web threadpool: the connection is opened with ``check_same_thread=False``
+*and* every access — the whole ``BEGIN IMMEDIATE`` … ``COMMIT``/``ROLLBACK``
+cycle, all reads and ``close()`` — is serialized by an explicit
+``threading.RLock``. The flag alone is never relied upon: the lock makes
+transaction boundaries indivisible across threads, while ``busy_timeout``
+still resolves contention between separate queue instances.
 """
 
 from __future__ import annotations
@@ -62,6 +68,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -312,6 +319,11 @@ class QueuedJob:
     ``CURRENT_TIMESTAMP`` itself. ``attempt`` is the claim generation
     (``retry_count`` at claim time) and must be echoed back on every worker
     state transition; it is ignored on enqueue.
+
+    ``checkpoint_data`` is an opaque JSON string the API layer uses to persist
+    request fields that have no dedicated column (e.g. language preference or
+    a requested mask region); the queue stores it verbatim and never parses
+    it. It is distinct from worker-produced runtime checkpoints.
     """
 
     id: str
@@ -322,6 +334,53 @@ class QueuedJob:
     upload_id: str | None = None
     cloud_consent: bool = False
     attempt: int = 0
+    checkpoint_data: str | None = None
+
+
+@dataclass(frozen=True)
+class JobRecord:
+    """Full stored view of a job, used by read-only API responses.
+
+    Unlike :class:`QueuedJob` (the worker-facing claim view) this carries
+    every ``jobs`` column, including timestamps and the parsed output list,
+    so the HTTP layer never has to issue raw SQL itself.
+    """
+
+    id: str
+    type: str
+    status: str
+    priority: int
+    environment: str | None
+    input_path: str | None
+    upload_id: str | None
+    output_paths: tuple[str, ...]
+    error_type: str | None
+    retry_count: int
+    checkpoint_data: str | None
+    cloud_consent: bool
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+
+
+# Full column list shared by the API read paths; keep in sync with the DDL.
+_JOB_COLUMNS = (
+    "id",
+    "type",
+    "priority",
+    "status",
+    "environment",
+    "input_path",
+    "output_paths",
+    "error_type",
+    "retry_count",
+    "checkpoint_data",
+    "cloud_consent",
+    "created_at",
+    "started_at",
+    "completed_at",
+)
+_JOB_COLUMN_LIST = ", ".join(_JOB_COLUMNS)
 
 
 class SQLiteQueue:
@@ -338,14 +397,23 @@ class SQLiteQueue:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._busy_timeout_ms = busy_timeout_ms
         self._enqueue_policy = enqueue_policy
+        # Reentrant lock serializing ALL access to the shared connection.
+        # RLock lets same-thread nested calls (e.g. size() -> count()) proceed
+        # while still fully excluding other threads for the duration of a
+        # transaction or a multi-statement read.
+        self._lock = threading.RLock()
         # ``timeout`` mirrors busy_timeout so the low-level driver waits too.
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=busy_timeout_ms / 1000,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._configure_connection(self._conn, busy_timeout_ms)
-        self._create_schema()
+        # ``check_same_thread=False`` permits cross-thread use, but safety is
+        # provided by ``self._lock`` above, not by this flag on its own.
+        with self._lock:
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                timeout=busy_timeout_ms / 1000,
+                check_same_thread=False,
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._configure_connection(self._conn, busy_timeout_ms)
+            self._create_schema()
 
     @staticmethod
     def _configure_connection(conn: sqlite3.Connection, busy_timeout_ms: int) -> None:
@@ -361,16 +429,22 @@ class SQLiteQueue:
 
     @contextmanager
     def _immediate(self) -> Iterator[sqlite3.Connection]:
-        """Hold a reserved write lock for the duration of one transaction."""
+        """Hold the instance lock and a reserved write transaction together.
+
+        The lock is taken before ``BEGIN IMMEDIATE`` and released only after
+        ``COMMIT``/``ROLLBACK``, so no other thread can interleave statements
+        inside another thread's transaction or observe a half-finished one.
+        """
         conn = self._conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield conn
-        except Exception:
-            conn.rollback()
-            raise
-        else:
-            conn.commit()
+        with self._lock:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
 
     @staticmethod
     def _to_job(row: sqlite3.Row) -> QueuedJob:
@@ -385,6 +459,7 @@ class SQLiteQueue:
                 upload_id=stored[len(_UPLOAD_PREFIX) :],
                 cloud_consent=bool(row["cloud_consent"]),
                 attempt=int(row["retry_count"]),
+                checkpoint_data=row["checkpoint_data"],
             )
         return QueuedJob(
             id=row["id"],
@@ -395,6 +470,35 @@ class SQLiteQueue:
             upload_id=None,
             cloud_consent=bool(row["cloud_consent"]),
             attempt=int(row["retry_count"]),
+            checkpoint_data=row["checkpoint_data"],
+        )
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> JobRecord:
+        stored = row["input_path"]
+        if isinstance(stored, str) and stored.startswith(_UPLOAD_PREFIX):
+            input_path: str | None = None
+            upload_id: str | None = stored[len(_UPLOAD_PREFIX) :]
+        else:
+            input_path = stored
+            upload_id = None
+        output_paths = _parse_output_paths(row["output_paths"])
+        return JobRecord(
+            id=row["id"],
+            type=row["type"],
+            status=row["status"],
+            priority=int(row["priority"]),
+            environment=row["environment"],
+            input_path=input_path,
+            upload_id=upload_id,
+            output_paths=output_paths,
+            error_type=row["error_type"],
+            retry_count=int(row["retry_count"]),
+            checkpoint_data=row["checkpoint_data"],
+            cloud_consent=bool(row["cloud_consent"]),
+            created_at=row["created_at"] or "",
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
         )
 
     def enqueue(self, job: QueuedJob) -> None:
@@ -456,9 +560,9 @@ class SQLiteQueue:
                     """
                     INSERT INTO jobs
                         (id, type, priority, status, input_path,
-                         cloud_consent, created_at)
+                         cloud_consent, created_at, checkpoint_data)
                     VALUES (?, ?, ?, 'queued', ?, ?,
-                            COALESCE(NULLIF(?, ''), CURRENT_TIMESTAMP))
+                            COALESCE(NULLIF(?, ''), CURRENT_TIMESTAMP), ?)
                     """,
                     (
                         job.id,
@@ -467,6 +571,7 @@ class SQLiteQueue:
                         stored_input,
                         int(job.cloud_consent),
                         job.created_at,
+                        job.checkpoint_data,
                     ),
                 )
         except sqlite3.IntegrityError as exc:
@@ -494,7 +599,7 @@ class SQLiteQueue:
                     LIMIT 1
                 )
                 RETURNING id, type, priority, created_at, input_path,
-                          cloud_consent, retry_count
+                          cloud_consent, retry_count, checkpoint_data
                 """,
                 (_STATUS_ASSIGNED, _STATUS_QUEUED),
             ).fetchone()
@@ -508,33 +613,86 @@ class SQLiteQueue:
 
     def count(self, status: str | None = None) -> int:
         """Count jobs, optionally restricted to one status."""
-        conn = self._conn
-        if status is None:
-            row = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
-        else:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status = ?", (status,)
-            ).fetchone()
-        return int(row[0])
+        with self._lock:
+            conn = self._conn
+            if status is None:
+                row = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status = ?", (status,)
+                ).fetchone()
+            return int(row[0])
 
     def get(self, job_id: str) -> QueuedJob | None:
         """Return the stored job or ``None`` if the id is unknown."""
-        row = self._conn.execute(
-            """
-            SELECT id, type, priority, created_at, input_path, cloud_consent,
-                   retry_count
-            FROM jobs WHERE id = ?
-            """,
-            (job_id,),
-        ).fetchone()
-        return None if row is None else self._to_job(row)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, type, priority, created_at, input_path, cloud_consent,
+                       retry_count, checkpoint_data
+                FROM jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            return None if row is None else self._to_job(row)
+
+    def fetch_job(self, job_id: str) -> JobRecord | None:
+        """Return the full stored job record, or ``None`` for unknown ids.
+
+        This is the read-only API counterpart of :meth:`get`: it never claims
+        or mutates anything and exposes every column needed for HTTP
+        responses.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {_JOB_COLUMN_LIST} FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return None if row is None else self._to_record(row)
+
+    def list_jobs(
+        self, *, status: str | None = None, limit: int = 50
+    ) -> list[JobRecord]:
+        """List stored jobs ordered ``priority DESC, created_at ASC, rowid ASC``.
+
+        ``status`` optionally restricts the result to one exact status string;
+        callers are expected to validate it against the API enum first.
+        ``limit`` must be a positive integer and is always applied so a
+        client can never request an unbounded scan.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        with self._lock:
+            if status is None:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMN_LIST}
+                    FROM jobs
+                    ORDER BY priority DESC, created_at ASC, rowid ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMN_LIST}
+                    FROM jobs
+                    WHERE status = ?
+                    ORDER BY priority DESC, created_at ASC, rowid ASC
+                    LIMIT ?
+                    """,
+                    (status, limit),
+                ).fetchall()
+            return [self._to_record(row) for row in rows]
 
     def get_status(self, job_id: str) -> str | None:
         """Return the current status string or ``None`` for unknown ids."""
-        row = self._conn.execute(
-            "SELECT status FROM jobs WHERE id = ?", (job_id,)
-        ).fetchone()
-        return None if row is None else str(row[0])
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return None if row is None else str(row[0])
 
     def _transition(
         self,
@@ -784,14 +942,42 @@ class SQLiteQueue:
             return recovered
 
     def close(self) -> None:
-        """Close the underlying database connection."""
-        self._conn.close()
+        """Close the underlying database connection.
+
+        The same instance lock guards shutdown so a close() cannot run while
+        another thread is inside a transaction or read.
+        """
+        with self._lock:
+            self._conn.close()
 
     def __enter__(self) -> SQLiteQueue:
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         self.close()
+
+
+def _parse_output_paths(raw: str | None) -> tuple[str, ...]:
+    """Decode the ``output_paths`` JSON column defensively.
+
+    The column is only ever written by trusted worker code via
+    ``json.dumps``, so malformed content can only come from a direct database
+    edit. Controlled degradation matches the checkpoint helper: an empty
+    value, malformed JSON, or a JSON value that is not a list yields an empty
+    tuple instead of an exception. Inside a list, only genuine strings are
+    kept — numbers, objects or ``null`` entries are never coerced into fake
+    filesystem paths. This function performs no database access, so real
+    SQLite errors are not swallowed.
+    """
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ()
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(item for item in parsed if isinstance(item, str))
 
 
 def _sql_timestamp() -> str:

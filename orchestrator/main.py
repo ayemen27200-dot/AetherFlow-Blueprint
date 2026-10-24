@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import Literal
 
 app = FastAPI(
     title="AetherFlow Orchestrator",
@@ -15,7 +16,10 @@ app = FastAPI(
 
 class JobSpec(BaseModel):
     type: Literal["split", "transcription", "text_removal"]
-    file: str = Field(min_length=1, description="Server-issued upload ID, never an arbitrary server path")
+    file: str = Field(
+        min_length=1,
+        description="Server-issued upload ID, never an arbitrary server path",
+    )
     language: str = "auto"
     environment: Literal["phone", "vps", "cloud"] | None = None
     cloud_consent: bool = False
@@ -56,4 +60,10 @@ async def get_job(job_id: str) -> Job:
 @app.get("/health")
 async def health() -> dict[str, object]:
     """Report scaffold status; production health must actively check DB and worker state."""
-    return {"status": "degraded", "components": {"database": "not_implemented", "worker": "not_implemented"}}
+    return {
+        "status": "degraded",
+        "components": {
+            "database": "not_implemented",
+            "worker": "not_implemented",
+        },
+    }

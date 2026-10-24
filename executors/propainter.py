@@ -1,7 +1,10 @@
 """ProPainter video inpainting executor; implementation is tracked by the related Dossier."""
 
 from __future__ import annotations
-from typing import Any, Callable
+
+from collections.abc import Callable
+from typing import Any
+
 from .base import Executor
 
 

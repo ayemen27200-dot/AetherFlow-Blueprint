@@ -288,3 +288,134 @@ def test_jobs_survive_a_service_restart(
         assert response.status_code == 200
         assert response.json()["status"] == "queued"
     get_settings.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
+# Audit follow-up: cloud consent, mandatory mask, checkpoint robustness
+# --------------------------------------------------------------------------- #
+
+
+def test_cloud_environment_requires_explicit_consent_and_writes_no_row(
+    client: TestClient, tmp_path
+) -> None:
+    forbidden = client.post(
+        "/jobs",
+        headers=AUTH,
+        json={
+            "type": "split",
+            "file": "up-cloud-1",
+            "environment": "cloud",
+            "cloud_consent": False,
+        },
+    )
+    assert forbidden.status_code == 403
+    assert "cloud_consent" in forbidden.json()["detail"]
+
+    raw = sqlite3.connect(tmp_path / "api.db")
+    try:
+        assert raw.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    finally:
+        raw.close()
+
+    # Explicit consent unlocks cloud, and non-cloud environments stay open.
+    consented = client.post(
+        "/jobs",
+        headers=AUTH,
+        json={
+            "type": "split",
+            "file": "up-cloud-2",
+            "environment": "cloud",
+            "cloud_consent": True,
+        },
+    )
+    assert consented.status_code == 202
+    vps = client.post(
+        "/jobs",
+        headers=AUTH,
+        json={"type": "split", "file": "up-vps-1", "environment": "vps"},
+    )
+    assert vps.status_code == 202
+
+
+def test_text_removal_requires_mask_region_before_any_write(
+    client: TestClient, tmp_path
+) -> None:
+    rejected = client.post(
+        "/jobs",
+        headers=AUTH,
+        json={"type": "text_removal", "file": "up-mask-1"},
+    )
+    assert rejected.status_code == 422
+
+    raw = sqlite3.connect(tmp_path / "api.db")
+    try:
+        assert raw.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+    finally:
+        raw.close()
+
+    # A valid mask makes the same job type acceptable, and other job types
+    # remain usable without a mask.
+    accepted = client.post(
+        "/jobs",
+        headers=AUTH,
+        json={
+            "type": "text_removal",
+            "file": "up-mask-2",
+            "mask_region": {"top": 0.82, "bottom": 1.0, "left": 0.0, "right": 1.0},
+        },
+    )
+    assert accepted.status_code == 202
+    split = client.post(
+        "/jobs", headers=AUTH, json={"type": "split", "file": "up-mask-3"}
+    )
+    assert split.status_code == 202
+
+
+@pytest.mark.parametrize("corrupt_value", ['{broken json', "123", "[1, 2, 3]", "null"])
+def test_corrupt_checkpoint_data_returns_controlled_response_not_500(
+    client: TestClient, tmp_path, corrupt_value: str
+) -> None:
+    created = client.post("/jobs", headers=AUTH, json=VALID_SPEC)
+    assert created.status_code == 202
+    job_id = created.json()["id"]
+
+    # Simulate a row whose checkpoint column was corrupted by a direct edit.
+    raw = sqlite3.connect(tmp_path / "api.db")
+    try:
+        raw.execute(
+            "UPDATE jobs SET checkpoint_data = ? WHERE id = ?",
+            (corrupt_value, job_id),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    response = client.get(f"/jobs/{job_id}", headers=AUTH)
+    # Graceful degradation: a normal Job payload with no environment hint,
+    # never an uncontrolled 500 and no parser internals in the response.
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == job_id
+    assert body["environment"] is None
+    # No parser internals or tracebacks leak into the controlled response.
+    assert "JSONDecodeError" not in response.text
+    assert "Traceback" not in response.text
+
+
+def test_checkpoint_payload_helper_handles_every_corrupt_shape() -> None:
+    from orchestrator.main import _load_checkpoint_payload
+
+    # Empty/None means no checkpoint at all.
+    assert _load_checkpoint_payload(None) == {}
+    assert _load_checkpoint_payload("") == {}
+    # Malformed JSON and non-object JSON degrade to an empty mapping.
+    assert _load_checkpoint_payload("{broken") == {}
+    assert _load_checkpoint_payload("123") == {}
+    assert _load_checkpoint_payload("[1, 2]") == {}
+    assert _load_checkpoint_payload("null") == {}
+    # A valid object is preserved, including the environment preference.
+    assert _load_checkpoint_payload('{"environment":"cloud"}') == {
+        "environment": "cloud"
+    }
+    # Non-string defensive input must not raise either.
+    assert _load_checkpoint_payload(123) == {}  # type: ignore[arg-type]

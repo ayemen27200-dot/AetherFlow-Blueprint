@@ -55,8 +55,12 @@ never passed to filesystem APIs.
 
 Worker threads that need full isolation should open their own
 ``SQLiteQueue`` instance. A single instance may also be shared across the
-web threadpool (the connection is opened with ``check_same_thread=False``;
-sqlite3 serializes its calls and ``BEGIN IMMEDIATE`` serializes writes).
+web threadpool: the connection is opened with ``check_same_thread=False``
+*and* every access — the whole ``BEGIN IMMEDIATE`` … ``COMMIT``/``ROLLBACK``
+cycle, all reads and ``close()`` — is serialized by an explicit
+``threading.RLock``. The flag alone is never relied upon: the lock makes
+transaction boundaries indivisible across threads, while ``busy_timeout``
+still resolves contention between separate queue instances.
 """
 
 from __future__ import annotations
@@ -64,6 +68,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -392,20 +397,23 @@ class SQLiteQueue:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._busy_timeout_ms = busy_timeout_ms
         self._enqueue_policy = enqueue_policy
+        # Reentrant lock serializing ALL access to the shared connection.
+        # RLock lets same-thread nested calls (e.g. size() -> count()) proceed
+        # while still fully excluding other threads for the duration of a
+        # transaction or a multi-statement read.
+        self._lock = threading.RLock()
         # ``timeout`` mirrors busy_timeout so the low-level driver waits too.
-        # ``check_same_thread=False`` lets the web layer share one queue across
-        # the FastAPI worker threadpool; sqlite3 serializes calls on the
-        # connection internally, while BEGIN IMMEDIATE keeps write transactions
-        # mutually exclusive. Dedicated worker threads may still open their own
-        # queue instance for full isolation.
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=busy_timeout_ms / 1000,
-            check_same_thread=False,
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._configure_connection(self._conn, busy_timeout_ms)
-        self._create_schema()
+        # ``check_same_thread=False`` permits cross-thread use, but safety is
+        # provided by ``self._lock`` above, not by this flag on its own.
+        with self._lock:
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                timeout=busy_timeout_ms / 1000,
+                check_same_thread=False,
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._configure_connection(self._conn, busy_timeout_ms)
+            self._create_schema()
 
     @staticmethod
     def _configure_connection(conn: sqlite3.Connection, busy_timeout_ms: int) -> None:
@@ -421,16 +429,22 @@ class SQLiteQueue:
 
     @contextmanager
     def _immediate(self) -> Iterator[sqlite3.Connection]:
-        """Hold a reserved write lock for the duration of one transaction."""
+        """Hold the instance lock and a reserved write transaction together.
+
+        The lock is taken before ``BEGIN IMMEDIATE`` and released only after
+        ``COMMIT``/``ROLLBACK``, so no other thread can interleave statements
+        inside another thread's transaction or observe a half-finished one.
+        """
         conn = self._conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            yield conn
-        except Exception:
-            conn.rollback()
-            raise
-        else:
-            conn.commit()
+        with self._lock:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
 
     @staticmethod
     def _to_job(row: sqlite3.Row) -> QueuedJob:
@@ -604,26 +618,28 @@ class SQLiteQueue:
 
     def count(self, status: str | None = None) -> int:
         """Count jobs, optionally restricted to one status."""
-        conn = self._conn
-        if status is None:
-            row = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
-        else:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM jobs WHERE status = ?", (status,)
-            ).fetchone()
-        return int(row[0])
+        with self._lock:
+            conn = self._conn
+            if status is None:
+                row = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status = ?", (status,)
+                ).fetchone()
+            return int(row[0])
 
     def get(self, job_id: str) -> QueuedJob | None:
         """Return the stored job or ``None`` if the id is unknown."""
-        row = self._conn.execute(
-            """
-            SELECT id, type, priority, created_at, input_path, cloud_consent,
-                   retry_count, checkpoint_data
-            FROM jobs WHERE id = ?
-            """,
-            (job_id,),
-        ).fetchone()
-        return None if row is None else self._to_job(row)
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT id, type, priority, created_at, input_path, cloud_consent,
+                       retry_count, checkpoint_data
+                FROM jobs WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            return None if row is None else self._to_job(row)
 
     def fetch_job(self, job_id: str) -> JobRecord | None:
         """Return the full stored job record, or ``None`` for unknown ids.
@@ -632,11 +648,12 @@ class SQLiteQueue:
         or mutates anything and exposes every column needed for HTTP
         responses.
         """
-        row = self._conn.execute(
-            f"SELECT {_JOB_COLUMN_LIST} FROM jobs WHERE id = ?",
-            (job_id,),
-        ).fetchone()
-        return None if row is None else self._to_record(row)
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {_JOB_COLUMN_LIST} FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return None if row is None else self._to_record(row)
 
     def list_jobs(
         self, *, status: str | None = None, limit: int = 50
@@ -650,35 +667,37 @@ class SQLiteQueue:
         """
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
             raise ValueError("limit must be a positive integer")
-        if status is None:
-            rows = self._conn.execute(
-                f"""
-                SELECT {_JOB_COLUMN_LIST}
-                FROM jobs
-                ORDER BY priority DESC, created_at ASC, rowid ASC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                f"""
-                SELECT {_JOB_COLUMN_LIST}
-                FROM jobs
-                WHERE status = ?
-                ORDER BY priority DESC, created_at ASC, rowid ASC
-                LIMIT ?
-                """,
-                (status, limit),
-            ).fetchall()
-        return [self._to_record(row) for row in rows]
+        with self._lock:
+            if status is None:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMN_LIST}
+                    FROM jobs
+                    ORDER BY priority DESC, created_at ASC, rowid ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {_JOB_COLUMN_LIST}
+                    FROM jobs
+                    WHERE status = ?
+                    ORDER BY priority DESC, created_at ASC, rowid ASC
+                    LIMIT ?
+                    """,
+                    (status, limit),
+                ).fetchall()
+            return [self._to_record(row) for row in rows]
 
     def get_status(self, job_id: str) -> str | None:
         """Return the current status string or ``None`` for unknown ids."""
-        row = self._conn.execute(
-            "SELECT status FROM jobs WHERE id = ?", (job_id,)
-        ).fetchone()
-        return None if row is None else str(row[0])
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return None if row is None else str(row[0])
 
     def _transition(
         self,
@@ -928,8 +947,13 @@ class SQLiteQueue:
             return recovered
 
     def close(self) -> None:
-        """Close the underlying database connection."""
-        self._conn.close()
+        """Close the underlying database connection.
+
+        The same instance lock guards shutdown so a close() cannot run while
+        another thread is inside a transaction or read.
+        """
+        with self._lock:
+            self._conn.close()
 
     def __enter__(self) -> SQLiteQueue:
         return self

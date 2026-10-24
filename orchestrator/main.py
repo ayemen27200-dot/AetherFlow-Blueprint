@@ -96,6 +96,19 @@ class JobSpec(BaseModel):
     preset: Literal["fast", "balanced", "high_quality"] | None = None
     mask_region: MaskRegion | None = None
 
+    @model_validator(mode="after")
+    def _require_mask_for_text_removal(self) -> JobSpec:
+        # The reviewed-OCR-mask exception path mentioned in the OpenAPI
+        # description is not represented in this model yet, so text_removal
+        # jobs must always carry an explicit mask region. Rejected at request
+        # validation (HTTP 422), before any queue or database interaction.
+        if self.type == "text_removal" and self.mask_region is None:
+            raise ValueError(
+                "mask_region is required for text_removal jobs until the "
+                "reviewed OCR mask workflow is implemented"
+            )
+        return self
+
 
 class Job(BaseModel):
     """Job representation returned by the API, aligned with the OpenAPI Job."""
@@ -186,9 +199,29 @@ def _iso_timestamp(value: str | None) -> str | None:
         return value
 
 
+def _load_checkpoint_payload(raw: str | None) -> dict:
+    """Parse stored checkpoint JSON defensively.
+
+    Rows are normally written by this service via ``json.dumps``, so invalid
+    content can only originate from a direct/manual database edit. The
+    controlled behavior is graceful degradation: an empty value, malformed
+    JSON or a non-object JSON value yields an empty mapping, so the API keeps
+    returning a normal Job response instead of an uncontrolled 500 and never
+    leaks parser internals. This function touches no database connection, so
+    genuine SQLite errors are not swallowed here.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _record_to_job(record: JobRecord) -> Job:
     """Map a full queue record onto the public Job response model."""
-    payload = json.loads(record.checkpoint_data) if record.checkpoint_data else {}
+    payload = _load_checkpoint_payload(record.checkpoint_data)
     return Job(
         id=record.id,
         status=record.status,
@@ -212,6 +245,15 @@ def _record_to_job(record: JobRecord) -> Job:
 )
 def create_job(spec: JobSpec, queue: QueueDep) -> Job:
     """Create a durably queued job from an opaque upload id."""
+    # Policy guard before any database interaction: cloud processing requires
+    # explicit, affirmative consent. Tier/quota policies are not implemented
+    # yet, and no cloud provider call is made anywhere in this path.
+    if spec.environment == "cloud" and not spec.cloud_consent:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="cloud processing requires explicit cloud_consent",
+        )
+
     try:
         upload_id = validate_upload_id(spec.file)
     except InvalidUploadIdError as exc:

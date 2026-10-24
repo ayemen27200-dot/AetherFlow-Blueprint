@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -1116,6 +1117,108 @@ def test_concurrent_workers_claim_each_job_exactly_once(tmp_path: Path) -> None:
     with SQLiteQueue(db_path) as queue:
         assert queue.size() == 0
         assert queue.count("assigned") == len(job_ids)
+
+
+def test_shared_queue_instance_is_safe_under_concurrent_enqueue_and_reads(
+    tmp_path: Path,
+) -> None:
+    """Regression test for the shared-connection audit finding.
+
+    One single SQLiteQueue object is hammered from a thread pool with
+    concurrent writes (enqueue) and reads (list_jobs/fetch_job/size/count/
+    get_status). The explicit RLock must keep every BEGIN IMMEDIATE
+    transaction indivisible and every read consistent: no sqlite threading or
+    transaction errors, and final row/request counts must match exactly.
+    """
+    db_path = tmp_path / "shared.db"
+    writer_threads = 8
+    per_thread = 25
+    expected_total = writer_threads * per_thread
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def record(exc: BaseException) -> None:  # pragma: no cover - surfaced below
+        with errors_lock:
+            errors.append(exc)
+
+    with SQLiteQueue(db_path) as shared:
+        def producer(worker_index: int) -> None:
+            try:
+                for index in range(per_thread):
+                    job_id = f"w{worker_index:02d}-j{index:03d}"
+                    shared.enqueue(
+                        QueuedJob(
+                            id=job_id,
+                            type="split",
+                            upload_id=f"up-{worker_index}-{index}",
+                            priority=index % 11,
+                        )
+                    )
+                    # Read traffic interleaved with the writes on the same object.
+                    assert shared.size() >= 0
+                    listing = shared.list_jobs(limit=10)
+                    assert len(listing) <= 10
+                    assert shared.count("queued") >= 0
+                    assert shared.get_status(job_id) == "queued"
+                    fetched = shared.fetch_job(job_id)
+                    assert fetched is not None and fetched.id == job_id
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                record(exc)
+
+        def reader() -> None:
+            try:
+                for _ in range(100):
+                    shared.list_jobs(limit=50)
+                    shared.count()
+                    shared.fetch_job("w00-j000")
+                    shared.get_status("w07-j024")
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                record(exc)
+
+        with ThreadPoolExecutor(max_workers=writer_threads + 4) as pool:
+            producer_futures = [
+                pool.submit(producer, worker_index)
+                for worker_index in range(writer_threads)
+            ]
+            reader_futures = [pool.submit(reader) for _ in range(4)]
+            for future in [*producer_futures, *reader_futures]:
+                future.result(timeout=60)
+
+        assert errors == []
+        assert shared.count() == expected_total
+        assert shared.size() == expected_total
+        # Every submitted job exists exactly once and is still queued.
+        all_rows = shared.list_jobs(limit=expected_total)
+        assert len(all_rows) == expected_total
+        assert len({row.id for row in all_rows}) == expected_total
+        assert all(row.status == "queued" for row in all_rows)
+
+        # Second wave: concurrent dequeue on the SAME shared instance must
+        # claim every job exactly once without transaction errors.
+        claimed: list[str] = []
+        claim_lock = threading.Lock()
+
+        def claimer() -> None:
+            try:
+                while True:
+                    job = shared.dequeue()
+                    if job is None:
+                        return
+                    with claim_lock:
+                        claimed.append(job.id)
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                record(exc)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            claim_futures = [pool.submit(claimer) for _ in range(8)]
+            for future in claim_futures:
+                future.result(timeout=60)
+
+        assert errors == []
+        assert len(claimed) == expected_total
+        assert len(set(claimed)) == expected_total
+        assert shared.size() == 0
+        assert shared.count("assigned") == expected_total
 
 
 def test_busy_timeout_raises_when_write_lock_is_held(tmp_path: Path) -> None:

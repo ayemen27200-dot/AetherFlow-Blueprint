@@ -1,6 +1,6 @@
-# AetherFlow Suite — Manifest v1.2 (Blueprint + Scaffold)
+# AetherFlow Suite — Manifest v1.3 (Blueprint + Partial D2 Implementation)
 
-> **Purpose:** hand-off package for staged implementation. This manifest describes the files that are present; it does not claim that the application has passed production acceptance.
+> **Purpose:** hand-off package for staged implementation. This manifest describes the files that are present and the state of their implementation; it does not claim that the application has passed production acceptance or that any gate G1–G5 has passed.
 
 ## Package inventory
 
@@ -12,21 +12,21 @@
 | D3 Core Engine | 7 | ASR, agent protocol, SSE, web UI, Tailscale, acceptance criteria and delivery note |
 | D4 Cloud Scale | 7 | ProPainter/mask policy, Modal, quota management, LiteLLM, Telegram, acceptance criteria and delivery note |
 | D5 Hardening | 7 | Test, security, accessibility, backup, CI/CD, release and delivery plans |
-| Root metadata and packaging | 8 | README, pyproject, `.env.example`, `.gitignore`, changelog, contributing guide, MIT license and manifest |
-| Python starter packages | 20 | `agent/`, `orchestrator/`, `executors/` and `web/` starter code |
+| Root metadata and packaging | 9 | README, `README_D2.md`, pyproject, `.env.example`, `.gitignore`, changelog, contributing guide, MIT license and manifest |
+| Python packages | 21 | `agent/`, `orchestrator/`, `executors/` and `web/`; D2 queue/API/worker/FFmpeg paths are implemented, later-milestone executors remain scaffolds |
 | Runtime configuration | 5 | Example config, transfer spec, error policies, rules and model-lock copy |
 | Docker deployment | 3 | Dockerfile, Caddy reverse proxy and Compose scaffold |
-| Scripts | 6 | Phone/VPS installers, setup wizard, spec validator and fixture generator (+ package initializer) |
-| Tests and fixture | 3 | Smoke tests, fixture instructions and synthetic 5-second MP4 |
-| **Total ZIP payload** | **86** | Files only; directory entries are not included in this count |
+| Scripts | 7 | Phone/VPS installers, setup wizard, spec validator, JUnit summary and fixture generator (+ package initializer) |
+| Tests and fixture | 12 | Unit/API/integration suites, media-toolchain guard, fixture instructions and the synthetic 5-second MP4 |
+| **Total payload (excluding caches/VCS metadata)** | **117** | Files only; directory entries are not included |
 
-The 41 Dossier files are the formal specification set. The remaining 45 files provide project metadata and starter implementation/scaffold assets.
+The 41 Dossier files are the formal specification set (D0–D5 documents). The remaining files provide project metadata, implemented D2 components or starter/scaffold assets for later milestones.
 
 ## Canonical files
 
 - `D0_MASTER_BLUEPRINT/ARCHITECTURE.md` — architecture and system boundaries.
 - `D1_FOUNDATION/03_API_SPEC.yaml` — canonical OpenAPI 3.1 contract. Do not treat Markdown tables as the machine-readable API contract.
-- `D1_FOUNDATION/02_DB_SCHEMA.sql` — proposed SQLite schema.
+- `D1_FOUNDATION/02_DB_SCHEMA.sql` — proposed SQLite schema; the queue's embedded DDL is guarded against drift from it by tests.
 - `D1_FOUNDATION/09_models.lock.json` and `config/models.lock.json` — model-lock templates; any placeholder hash or unpinned model revision must be resolved and verified before release.
 - `D4_CLOUD_SCALE/01_PROPAINTER_EXECUTOR.md` — mask generation, review and validation requirements.
 - `scripts/init_wizard.py` — interactive setup; writes `.env` with mode `0600` and avoids printing secret values.
@@ -41,15 +41,82 @@ From the project root, with Python 3.11+:
 python -m pip install -e ".[dev]"
 python scripts/validate_specs.py
 python -m compileall -q agent orchestrator executors web scripts
+ruff check .
 pytest -q
 bash -n scripts/install_phone.sh scripts/install_vps.sh scripts/generate_test_fixture.sh
+```
+
+For the full media pipeline (mirrors CI), install FFmpeg and FFprobe and
+enable the toolchain guard so a missing binary fails the run instead of
+skipping the integration tests; JUnit output and the job summary carry the
+exact pass/fail/skip counts:
+
+```bash
+export AETHERFLOW_REQUIRE_MEDIA_BINARIES=1
+pytest -q -ra --junitxml=test-results/junit.xml
+python scripts/summarize_junit.py test-results/junit.xml
 ```
 
 The included MP4 is a synthetic transport/splitting fixture; it does not test Arabic transcription, subtitle-mask accuracy, long-video behavior, or ProPainter visual quality. The validator checks YAML parsing and local OpenAPI `$ref` integrity; run `openapi-spec-validator D1_FOUNDATION/03_API_SPEC.yaml` for additional contract validation.
 
 ## Honest implementation status
 
-This package is a **blueprint plus starter scaffold**, not a completed production video-processing product. Current source returns an explicit `501 Not Implemented` for job endpoints. The persistent job queue, upload handling and media validation, phone-agent protocol, real FFmpeg/ASR/ProPainter execution, cloud dispatch and quota enforcement, auth enforcement, operational metrics, UI behavior and end-to-end workflow still need implementation and acceptance testing.
+This package is a blueprint **plus a partially implemented D2 MVP**, not a
+completed production video-processing product. The breakdown below is
+evidence-based; test counts are produced by the suite itself and archived as
+a JUnit artifact in CI, not estimated.
+
+### Implemented and covered by automated tests
+
+- **Orchestrator HTTP API** (`orchestrator/main.py`): fail-closed Bearer
+  authentication, `POST /jobs` / `GET /jobs` / `GET /jobs/{id}`, contract
+  ordering and status filtering, opaque upload-id validation (server
+  filesystem paths are never accepted), durable 503 mapping on SQLite
+  failures, and a response serializer that strips any absolute or
+  parent-escaping output path so API responses only expose root-relative
+  output references.
+- **Durable SQLite queue** (`orchestrator/queue.py`): WAL, busy timeout,
+  atomic generation-fenced claims, type-filtered `dequeue`, fenced
+  `complete_job` publishing verified outputs, explicit evidence-only
+  recovery (no time-based automatic rescheduling), and fail-closed local
+  path policy.
+- **FFmpeg split executor** (`executors/ffmpeg.py`): argv-list subprocess
+  only (shell use is structurally forbidden by a test), stream copy without
+  re-encoding, bounded timeout and process-group cancellation, progress
+  parsing, and real media validation — a duration probe plus a full decode
+  requiring exit code 0 and an empty error stream, applied to inputs and
+  every output part; partial output is discarded on failure.
+- **Worker pipeline** (`agent/worker.py`, `agent/upload_store.py`,
+  `agent/cli.py`): the end-to-end local path API → durable queue → worker →
+  FFmpeg → verified outputs runs against the synthetic fixture, with a
+  pool-wide shared job budget, a tested concurrency cap, stable path-free
+  error codes, relative output references, graceful signal handling, and
+  separate trusted-local (`aetherflow split`) and durable-queue
+  (`aetherflow worker run`) execution channels.
+- **CI**: installs real FFmpeg/FFprobe, hard-fails via the media toolchain
+  guard, runs Ruff and the full suite with zero unexplained skips on the
+  runner, and publishes JUnit results plus a job-summary count.
+
+### Implemented but not yet operationally proven
+
+- `/health` still returns the static `degraded` state; active DB/worker
+  health checks are not implemented.
+- Docker/Compose/Caddy clean-install, file-permission and TLS behaviour are
+  scaffolded but have not been verified on a clean host.
+- The 30-minute media split and its performance targets are not measured;
+  they require the target VPS and a large fixture.
+- Logging is structured and path-free in the new worker, but a full
+  secret-leak audit of every component has not been performed.
+
+### Not implemented (later milestones)
+
+- `POST /uploads`, SSE progress, API-driven cancellation, agent heartbeats
+  and the phone-agent control protocol (`agent/agent.py` remains a
+  scaffold), Whisper/ASR and ProPainter executors (still scaffolds), cloud
+  dispatch, quota enforcement, automatic stall recovery, and the web UI.
+- No G2 acceptance is declared here: the implemented pipeline items have
+  automated evidence, but the gate remains open pending independent review
+  of that evidence and the unproven operational items above.
 
 The installers automate prerequisites and initial configuration only; successful installation does not mean the jobs will run. Do not claim “100% ready”, “production-ready”, or that any gate G1–G5 has passed until evidence is recorded for each acceptance criterion. Do not deploy a public endpoint until authentication, authorization, upload validation, rate limits, TLS/domain settings and firewall rules have been reviewed.
 

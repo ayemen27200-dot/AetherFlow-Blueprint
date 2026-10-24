@@ -93,7 +93,26 @@ def _worker(db_path: Path, store_dir: Path, output_dir: Path) -> QueueWorker:
         ffmpeg_cmd=FFMPEG,
         ffprobe_cmd=shutil.which("ffprobe"),
     )
-    return QueueWorker(queue, executor, store)
+    return QueueWorker(
+        queue, executor, store, output_base_dir=output_dir
+    )
+
+
+def _assert_no_absolute_path_leak(references: list[str]) -> None:
+    """Public records must only expose root-relative output references."""
+    assert references, "completed job must publish output references"
+    for ref in references:
+        assert not Path(ref).is_absolute(), f"absolute path leaked: {ref}"
+        assert ".." not in Path(ref).parts
+        assert not ref.startswith(("/", "\\"))
+
+
+def _resolve_reference(output_dir: Path, ref: str) -> Path:
+    """Resolve a public output reference back to the real file for verification."""
+    path = (output_dir / ref).resolve()
+    # The resolved verification target must stay inside the private output root.
+    assert path.is_relative_to(output_dir.resolve())
+    return path
 
 
 def _create_job(client: TestClient, upload_id: str) -> str:
@@ -124,17 +143,22 @@ def test_g2_create_process_and_verify_real_split(environment) -> None:
     record = client.get(f"/jobs/{job_id}", headers=AUTH).json()
     assert record["status"] == "completed"
     assert record["error_type"] is None
-    assert record["output_paths"], "completed job must publish verified outputs"
+    references = record["output_paths"]
+    _assert_no_absolute_path_leak(references)
+    # The storage root must never appear in any public job representation.
+    body = client.get("/jobs", headers=AUTH).text
+    assert str(output_dir) not in body and str(store_dir) not in body
 
-    for path in (Path(p) for p in record["output_paths"]):
-        # Outputs live under the configured root in a job-specific folder.
-        assert path.resolve().is_relative_to(output_dir.resolve())
+    for ref in references:
+        # Public reference -> private file resolved only inside the test.
+        path = _resolve_reference(output_dir, ref)
         assert path.parent.name == job_id
         assert path.is_file() and path.stat().st_size > 0
         _decode_clean(path)  # independent re-decode, not the executor's word
 
     listed = client.get("/jobs", headers=AUTH, params={"status": "completed"}).json()
-    assert any(job["id"] == job_id for job in listed)
+    listed_job = next(job for job in listed if job["id"] == job_id)
+    _assert_no_absolute_path_leak(listed_job["output_paths"])
 
 
 def test_g2_path_like_upload_id_is_rejected_at_the_api(environment) -> None:
@@ -204,7 +228,10 @@ def test_g2_queued_job_survives_worker_restart(environment) -> None:
 
     record = client.get(f"/jobs/{job_id}", headers=AUTH).json()
     assert record["status"] == "completed"
-    for path in (Path(p) for p in record["output_paths"]):
+    references = record["output_paths"]
+    _assert_no_absolute_path_leak(references)
+    for ref in references:
+        path = _resolve_reference(output_dir, ref)
         assert path.is_file() and path.stat().st_size > 0
         _decode_clean(path)
 
@@ -232,7 +259,10 @@ def test_g2_cli_worker_processes_one_queued_job(environment) -> None:
     )
     assert result.exit_code == 0, result.output
     record = client.get(f"/jobs/{job_id}", headers=AUTH).json()
-    assert record["status"] == "completed" and record["output_paths"]
+    assert record["status"] == "completed"
+    _assert_no_absolute_path_leak(record["output_paths"])
+    for ref in record["output_paths"]:
+        _decode_clean(_resolve_reference(output_dir, ref))
 
 
 def test_g2_cli_local_split_uses_trusted_path(environment) -> None:

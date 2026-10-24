@@ -464,13 +464,23 @@ def test_corrupt_output_paths_never_returns_500(
     assert listed["output_paths"] == []
 
 
-def test_valid_output_paths_still_serialize(client: TestClient, tmp_path) -> None:
-    job_id = _create_job_and_corrupt(
-        client, tmp_path, "output_paths", '["/out/a.mp4", "/out/b.mp4"]'
-    )
+def test_output_references_serialize_but_absolute_paths_never_leak(
+    client: TestClient, tmp_path
+) -> None:
+    # Direct database tampering (the worker itself can only write relative
+    # references): one safe reference, one absolute server path, one parent
+    # escape. The API must keep the safe reference and strip the rest.
+    tampered = '["job-1/part_000.mp4", "/srv/storage/secret.mp4", "../escape.mp4"]'
+    job_id = _create_job_and_corrupt(client, tmp_path, "output_paths", tampered)
     response = client.get(f"/jobs/{job_id}", headers=AUTH)
     assert response.status_code == 200
-    assert response.json()["output_paths"] == ["/out/a.mp4", "/out/b.mp4"]
+    assert response.json()["output_paths"] == ["job-1/part_000.mp4"]
+    assert "/srv/storage" not in response.text and ".." not in response.text
+
+    # The same guarantee applies to the list endpoint.
+    listing = client.get("/jobs", headers=AUTH)
+    listed = next(job for job in listing.json() if job["id"] == job_id)
+    assert listed["output_paths"] == ["job-1/part_000.mp4"]
 
 
 @pytest.mark.parametrize("bad_environment", ['"datacenter"', "123", "null", '["cloud"]'])

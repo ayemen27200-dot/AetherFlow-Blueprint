@@ -66,6 +66,10 @@ jobs:
           mkdir -p test-results
           pytest -q -ra --junitxml=test-results/junit.xml
 
+      - name: Publish test count summary
+        if: always()
+        run: python scripts/summarize_junit.py test-results/junit.xml
+
       - name: Upload machine-readable test results
         # Published as a run artifact so exact pass/fail/skip counts can be
         # audited independently of the runner's raw Azure log stream.

@@ -985,6 +985,98 @@ def test_recovery_has_no_automatic_call_site() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# API read models: checkpoint persistence, fetch_job and list_jobs
+# --------------------------------------------------------------------------- #
+
+
+def test_checkpoint_data_round_trips_through_enqueue_dequeue_and_get(
+    tmp_path: Path,
+) -> None:
+    payload = '{"language":"ar","preset":"fast"}'
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(
+            QueuedJob(
+                id="j1",
+                type="split",
+                upload_id="up-1",
+                checkpoint_data=payload,
+            )
+        )
+        claimed = queue.dequeue()
+        assert claimed is not None
+        assert claimed.checkpoint_data == payload
+        fetched = queue.get("j1")
+        assert fetched is not None
+        assert fetched.checkpoint_data == payload
+
+
+def test_fetch_job_returns_full_record_and_decodes_upload_id(
+    tmp_path: Path,
+) -> None:
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(QueuedJob(id="j1", type="split", upload_id="up-42"))
+        assert queue.fetch_job("ghost") is None
+
+        record = queue.fetch_job("j1")
+        assert record is not None
+        assert record.id == "j1"
+        assert record.status == "queued"
+        assert record.upload_id == "up-42"
+        assert record.input_path is None
+        assert record.output_paths == ()
+        assert record.retry_count == 0
+        assert record.started_at is None
+        assert record.created_at
+
+    # Output paths and error type stored by a later worker stage parse back.
+    with raw_connect(tmp_path / "q.db") as conn:
+        conn.execute(
+            "UPDATE jobs SET output_paths = ?, error_type = ? WHERE id = 'j1'",
+            ('["/out/a.mp4", "/out/b.mp4"]', "TOOL_ERROR"),
+        )
+        conn.commit()
+    with SQLiteQueue(tmp_path / "q.db") as reopened:
+        record = reopened.fetch_job("j1")
+        assert record is not None
+        assert record.output_paths == ("/out/a.mp4", "/out/b.mp4")
+        assert record.error_type == "TOOL_ERROR"
+
+
+def test_list_jobs_orders_by_priority_then_creation_and_filters_status(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        # Same-second inserts; created_at ties are broken by insertion order.
+        queue.enqueue(make_job("low", priority=1, created_at="2026-01-01 00:00:00"))
+        queue.enqueue(make_job("high", priority=9, created_at="2026-01-01 00:00:00"))
+        queue.enqueue(make_job("mid", priority=5, created_at="2026-01-01 00:00:00"))
+        queue.enqueue(make_job("early_high", priority=9, created_at="2025-12-31 00:00:00"))
+
+        ordered = [record.id for record in queue.list_jobs()]
+        assert ordered == ["early_high", "high", "mid", "low"]
+
+        limited = [record.id for record in queue.list_jobs(limit=2)]
+        assert limited == ["early_high", "high"]
+
+        queued_ids = [
+            record.id for record in queue.list_jobs(status="queued", limit=10)
+        ]
+        assert queued_ids == ordered
+
+        # Claim one row; the status filter then excludes it.
+        claimed = queue.dequeue()
+        assert claimed is not None
+        assert queue.list_jobs(status="assigned")[0].id == claimed.id
+        assert all(record.status == "assigned" for record in queue.list_jobs(status="assigned"))
+        assert len(queue.list_jobs(status="queued")) == 3
+
+        for bad_limit in (0, -1, True, "5"):
+            with pytest.raises(ValueError, match="limit"):
+                queue.list_jobs(limit=bad_limit)  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------- #
 # Concurrency and locking
 # --------------------------------------------------------------------------- #
 

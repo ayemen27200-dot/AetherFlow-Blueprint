@@ -53,8 +53,10 @@ paths: they carry an opaque ``QueuedJob.upload_id`` (the ``POST /uploads``
 contract in ``D2_MVP/02_IMPLEMENTATION_MAP.md``) which is token-validated and
 never passed to filesystem APIs.
 
-Each worker/thread should open its own ``SQLiteQueue`` instance; the wrapped
-sqlite3 connection is not shared across threads by design.
+Worker threads that need full isolation should open their own
+``SQLiteQueue`` instance. A single instance may also be shared across the
+web threadpool (the connection is opened with ``check_same_thread=False``;
+sqlite3 serializes its calls and ``BEGIN IMMEDIATE`` serializes writes).
 """
 
 from __future__ import annotations
@@ -312,6 +314,11 @@ class QueuedJob:
     ``CURRENT_TIMESTAMP`` itself. ``attempt`` is the claim generation
     (``retry_count`` at claim time) and must be echoed back on every worker
     state transition; it is ignored on enqueue.
+
+    ``checkpoint_data`` is an opaque JSON string the API layer uses to persist
+    request fields that have no dedicated column (e.g. language preference or
+    a requested mask region); the queue stores it verbatim and never parses
+    it. It is distinct from worker-produced runtime checkpoints.
     """
 
     id: str
@@ -322,6 +329,53 @@ class QueuedJob:
     upload_id: str | None = None
     cloud_consent: bool = False
     attempt: int = 0
+    checkpoint_data: str | None = None
+
+
+@dataclass(frozen=True)
+class JobRecord:
+    """Full stored view of a job, used by read-only API responses.
+
+    Unlike :class:`QueuedJob` (the worker-facing claim view) this carries
+    every ``jobs`` column, including timestamps and the parsed output list,
+    so the HTTP layer never has to issue raw SQL itself.
+    """
+
+    id: str
+    type: str
+    status: str
+    priority: int
+    environment: str | None
+    input_path: str | None
+    upload_id: str | None
+    output_paths: tuple[str, ...]
+    error_type: str | None
+    retry_count: int
+    checkpoint_data: str | None
+    cloud_consent: bool
+    created_at: str
+    started_at: str | None
+    completed_at: str | None
+
+
+# Full column list shared by the API read paths; keep in sync with the DDL.
+_JOB_COLUMNS = (
+    "id",
+    "type",
+    "priority",
+    "status",
+    "environment",
+    "input_path",
+    "output_paths",
+    "error_type",
+    "retry_count",
+    "checkpoint_data",
+    "cloud_consent",
+    "created_at",
+    "started_at",
+    "completed_at",
+)
+_JOB_COLUMN_LIST = ", ".join(_JOB_COLUMNS)
 
 
 class SQLiteQueue:
@@ -339,9 +393,15 @@ class SQLiteQueue:
         self._busy_timeout_ms = busy_timeout_ms
         self._enqueue_policy = enqueue_policy
         # ``timeout`` mirrors busy_timeout so the low-level driver waits too.
+        # ``check_same_thread=False`` lets the web layer share one queue across
+        # the FastAPI worker threadpool; sqlite3 serializes calls on the
+        # connection internally, while BEGIN IMMEDIATE keeps write transactions
+        # mutually exclusive. Dedicated worker threads may still open their own
+        # queue instance for full isolation.
         self._conn = sqlite3.connect(
             str(self.db_path),
             timeout=busy_timeout_ms / 1000,
+            check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
         self._configure_connection(self._conn, busy_timeout_ms)
@@ -385,6 +445,7 @@ class SQLiteQueue:
                 upload_id=stored[len(_UPLOAD_PREFIX) :],
                 cloud_consent=bool(row["cloud_consent"]),
                 attempt=int(row["retry_count"]),
+                checkpoint_data=row["checkpoint_data"],
             )
         return QueuedJob(
             id=row["id"],
@@ -395,6 +456,40 @@ class SQLiteQueue:
             upload_id=None,
             cloud_consent=bool(row["cloud_consent"]),
             attempt=int(row["retry_count"]),
+            checkpoint_data=row["checkpoint_data"],
+        )
+
+    @staticmethod
+    def _to_record(row: sqlite3.Row) -> JobRecord:
+        stored = row["input_path"]
+        if isinstance(stored, str) and stored.startswith(_UPLOAD_PREFIX):
+            input_path: str | None = None
+            upload_id: str | None = stored[len(_UPLOAD_PREFIX) :]
+        else:
+            input_path = stored
+            upload_id = None
+        raw_outputs = row["output_paths"]
+        if raw_outputs:
+            parsed = json.loads(raw_outputs)
+            output_paths = tuple(str(item) for item in parsed)
+        else:
+            output_paths = ()
+        return JobRecord(
+            id=row["id"],
+            type=row["type"],
+            status=row["status"],
+            priority=int(row["priority"]),
+            environment=row["environment"],
+            input_path=input_path,
+            upload_id=upload_id,
+            output_paths=output_paths,
+            error_type=row["error_type"],
+            retry_count=int(row["retry_count"]),
+            checkpoint_data=row["checkpoint_data"],
+            cloud_consent=bool(row["cloud_consent"]),
+            created_at=row["created_at"] or "",
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
         )
 
     def enqueue(self, job: QueuedJob) -> None:
@@ -456,9 +551,9 @@ class SQLiteQueue:
                     """
                     INSERT INTO jobs
                         (id, type, priority, status, input_path,
-                         cloud_consent, created_at)
+                         cloud_consent, created_at, checkpoint_data)
                     VALUES (?, ?, ?, 'queued', ?, ?,
-                            COALESCE(NULLIF(?, ''), CURRENT_TIMESTAMP))
+                            COALESCE(NULLIF(?, ''), CURRENT_TIMESTAMP), ?)
                     """,
                     (
                         job.id,
@@ -467,6 +562,7 @@ class SQLiteQueue:
                         stored_input,
                         int(job.cloud_consent),
                         job.created_at,
+                        job.checkpoint_data,
                     ),
                 )
         except sqlite3.IntegrityError as exc:
@@ -494,7 +590,7 @@ class SQLiteQueue:
                     LIMIT 1
                 )
                 RETURNING id, type, priority, created_at, input_path,
-                          cloud_consent, retry_count
+                          cloud_consent, retry_count, checkpoint_data
                 """,
                 (_STATUS_ASSIGNED, _STATUS_QUEUED),
             ).fetchone()
@@ -522,12 +618,60 @@ class SQLiteQueue:
         row = self._conn.execute(
             """
             SELECT id, type, priority, created_at, input_path, cloud_consent,
-                   retry_count
+                   retry_count, checkpoint_data
             FROM jobs WHERE id = ?
             """,
             (job_id,),
         ).fetchone()
         return None if row is None else self._to_job(row)
+
+    def fetch_job(self, job_id: str) -> JobRecord | None:
+        """Return the full stored job record, or ``None`` for unknown ids.
+
+        This is the read-only API counterpart of :meth:`get`: it never claims
+        or mutates anything and exposes every column needed for HTTP
+        responses.
+        """
+        row = self._conn.execute(
+            f"SELECT {_JOB_COLUMN_LIST} FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        return None if row is None else self._to_record(row)
+
+    def list_jobs(
+        self, *, status: str | None = None, limit: int = 50
+    ) -> list[JobRecord]:
+        """List stored jobs ordered ``priority DESC, created_at ASC, rowid ASC``.
+
+        ``status`` optionally restricts the result to one exact status string;
+        callers are expected to validate it against the API enum first.
+        ``limit`` must be a positive integer and is always applied so a
+        client can never request an unbounded scan.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        if status is None:
+            rows = self._conn.execute(
+                f"""
+                SELECT {_JOB_COLUMN_LIST}
+                FROM jobs
+                ORDER BY priority DESC, created_at ASC, rowid ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                f"""
+                SELECT {_JOB_COLUMN_LIST}
+                FROM jobs
+                WHERE status = ?
+                ORDER BY priority DESC, created_at ASC, rowid ASC
+                LIMIT ?
+                """,
+                (status, limit),
+            ).fetchall()
+        return [self._to_record(row) for row in rows]
 
     def get_status(self, job_id: str) -> str | None:
         """Return the current status string or ``None`` for unknown ids."""

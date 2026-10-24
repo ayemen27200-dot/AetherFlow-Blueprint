@@ -492,6 +492,33 @@ def test_jobs_without_any_input_reference_remain_supported(tmp_path: Path) -> No
         assert claimed.upload_id is None
 
 
+def test_empty_input_path_is_rejected_alone_and_with_upload_id(
+    tmp_path: Path,
+) -> None:
+    # None means "no reference"; an empty string is malformed input and must
+    # be rejected before any SQLite write in both channel combinations.
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        with pytest.raises(InvalidJobInputError):
+            queue.enqueue(QueuedJob(id="j1", type="split", input_path=""))
+        with pytest.raises(InvalidJobInputError):
+            queue.enqueue(
+                QueuedJob(
+                    id="j2",
+                    type="split",
+                    input_path="",
+                    upload_id="up-1",
+                )
+            )
+        assert queue.size() == 0
+
+    with raw_connect(db_path) as conn:
+        rows = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        stored = conn.execute("SELECT input_path FROM jobs").fetchall()
+    assert rows == 0
+    assert stored == []
+
+
 # --------------------------------------------------------------------------- #
 # Guarded state transitions and fencing
 # --------------------------------------------------------------------------- #
@@ -556,8 +583,13 @@ def test_stale_generation_cannot_drive_transitions(tmp_path: Path) -> None:
         assert first is not None
         queue.mark_processing("j1", generation=first.attempt)
 
-        # Supervisor evidence: the original worker is dead.
-        recovered = queue.recover_claimed_jobs(["j1"], reason="worker process exited")
+        # Supervisor evidence: the original worker is dead. The supervisor
+        # presents the claim generation it observed (first.attempt == 0).
+        recovered = queue.recover_claimed_jobs(
+            ["j1"],
+            generation_by_id={"j1": first.attempt},
+            reason="worker process exited",
+        )
         assert recovered == 1
         second = queue.dequeue()
         assert second is not None
@@ -601,7 +633,9 @@ def test_recover_claimed_jobs_requeues_with_audit_event(tmp_path: Path) -> None:
         queue.mark_processing("j1", generation=claimed.attempt)
 
         recovered = queue.recover_claimed_jobs(
-            ["j1"], reason="heartbeat lost: environment offline"
+            ["j1"],
+            generation_by_id={"j1": claimed.attempt},
+            reason="heartbeat lost: environment offline",
         )
         assert recovered == 1
         assert queue.get_status("j1") == "queued"
@@ -637,8 +671,12 @@ def test_recover_fails_job_after_retry_budget_exhausted(tmp_path: Path) -> None:
             )
             conn.commit()
 
+        # The supervisor observed the claim generation currently stored
+        # (retry_count was raised to 3 to simulate the exhausted budget).
         recovered = queue.recover_claimed_jobs(
-            ["j_exhausted"], reason="worker OOM kill confirmed"
+            ["j_exhausted"],
+            generation_by_id={"j_exhausted": 3},
+            reason="worker OOM kill confirmed",
         )
         assert recovered == 1
         assert queue.get_status("j_exhausted") == "failed"
@@ -663,7 +701,9 @@ def test_recover_ignores_unclaimed_and_unknown_jobs(tmp_path: Path) -> None:
 
         # A job that was never claimed is not stalled and stays untouched.
         recovered = queue.recover_claimed_jobs(
-            ["queued_only", "claimed"], reason="supervisor restart"
+            ["queued_only", "claimed"],
+            generation_by_id={"queued_only": 0, "claimed": claimed.attempt},
+            reason="supervisor restart",
         )
         assert recovered == 1
         assert queue.get_status("queued_only") == "queued"
@@ -672,17 +712,192 @@ def test_recover_ignores_unclaimed_and_unknown_jobs(tmp_path: Path) -> None:
         # Re-recovering the now-queued job is a safe no-op: nothing claimed,
         # no rows changed, no events written.
         assert (
-            queue.recover_claimed_jobs(["queued_only"], reason="duplicate call")
+            queue.recover_claimed_jobs(
+                ["queued_only"],
+                generation_by_id={"queued_only": 0},
+                reason="duplicate call",
+            )
             == 0
         )
         assert queue.get_status("queued_only") == "queued"
 
         with pytest.raises(JobNotFoundError):
-            queue.recover_claimed_jobs(["ghost"], reason="no evidence")
+            queue.recover_claimed_jobs(
+                ["ghost"], generation_by_id={"ghost": 0}, reason="no evidence"
+            )
         with pytest.raises(ValueError, match="reason"):
-            queue.recover_claimed_jobs(["claimed"], reason="   ")
+            queue.recover_claimed_jobs(
+                ["claimed"], generation_by_id={"claimed": 0}, reason="   "
+            )
         with pytest.raises(ValueError, match="empty"):
-            queue.recover_claimed_jobs([], reason="nothing")
+            queue.recover_claimed_jobs([], generation_by_id={}, reason="nothing")
+        # The supervisor must prove the observed generation for every job.
+        with pytest.raises(ValueError, match="generation"):
+            queue.recover_claimed_jobs(
+                ["claimed"], generation_by_id={}, reason="missing fencing token"
+            )
+        with pytest.raises(TypeError):
+            queue.recover_claimed_jobs(
+                ["claimed"],
+                generation_by_id=[("claimed", 0)],  # type: ignore[dict-item]
+                reason="mapping required",
+            )
+
+
+def test_recovery_with_correct_generation_reclaims_and_logs_one_event(
+    tmp_path: Path,
+) -> None:
+    """Audit scenarios (a) and (c): a recovery matching the observed claim
+    generation succeeds, moves the job back to queued and writes exactly one
+    audit event; the job is then re-claimable under a new generation."""
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        queue.enqueue(make_job("j1"))
+        first = queue.dequeue()
+        assert first is not None
+        assert first.attempt == 0
+        queue.mark_processing("j1", generation=first.attempt)
+
+        recovered = queue.recover_claimed_jobs(
+            ["j1"],
+            generation_by_id={"j1": first.attempt},
+            reason="worker heartbeats lost",
+        )
+        assert recovered == 1
+        assert queue.get_status("j1") == "queued"
+
+        second = queue.dequeue()
+        assert second is not None
+        assert second.attempt == 1
+
+    with raw_connect(db_path) as conn:
+        events = conn.execute(
+            "SELECT event_type FROM job_events WHERE job_id = 'j1'"
+        ).fetchall()
+    assert [row["event_type"] for row in events] == ["job_requeued"]
+
+
+def test_stale_recovery_generation_is_a_noop_without_event_or_state_change(
+    tmp_path: Path,
+) -> None:
+    """Audit scenario (b): after gen-0 recovery and a gen-1 re-claim, a
+    duplicated supervisor notification still presenting generation 0 must not
+    touch the newer worker's state and must not write a recovery event."""
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        queue.enqueue(make_job("j1"))
+        first = queue.dequeue()
+        assert first is not None
+        # First, genuine recovery at generation 0, then a fresh gen-1 claim.
+        assert (
+            queue.recover_claimed_jobs(
+                ["j1"],
+                generation_by_id={"j1": first.attempt},
+                reason="first crash",
+            )
+            == 1
+        )
+        second = queue.dequeue()
+        assert second is not None
+        assert second.attempt == 1
+        queue.mark_processing("j1", generation=second.attempt)
+
+        # Stale duplicate notification still carrying the dead generation 0.
+        recovered = queue.recover_claimed_jobs(
+            ["j1"],
+            generation_by_id={"j1": 0},
+            reason="stale duplicate notification",
+        )
+        assert recovered == 0
+        assert queue.get_status("j1") == "processing"
+        job = queue.get("j1")
+        assert job is not None
+        assert job.attempt == 1
+
+    with raw_connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT status, retry_count, started_at FROM jobs WHERE id = 'j1'"
+        ).fetchone()
+        assert row["status"] == "processing"
+        assert row["retry_count"] == 1
+        assert row["started_at"] is not None
+        events = conn.execute(
+            "SELECT event_type, payload_json FROM job_events WHERE job_id = 'j1'"
+        ).fetchall()
+    # Exactly one event exists — from the genuine gen-0 recovery only.
+    assert len(events) == 1
+    assert events[0]["event_type"] == "job_requeued"
+    assert json.loads(events[0]["payload_json"])["reason"] == "first crash"
+
+
+def test_recovery_mixed_batch_skips_stale_generation_and_recovers_live_claim(
+    tmp_path: Path,
+) -> None:
+    """One batch containing a stale entry and a valid entry must recover only
+    the job whose generation matches, emitting exactly one event."""
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        queue.enqueue(make_job("j_stale"))
+        queue.enqueue(make_job("j_live"))
+
+        stale_claim = queue.dequeue()
+        live_claim = queue.dequeue()
+        assert stale_claim is not None and live_claim is not None
+        assert stale_claim.id == "j_stale"
+        queue.mark_processing("j_stale", generation=stale_claim.attempt)
+        queue.mark_processing("j_live", generation=live_claim.attempt)
+
+        # j_stale is genuinely recovered once and re-claimed at generation 1.
+        assert (
+            queue.recover_claimed_jobs(
+                ["j_stale"],
+                generation_by_id={"j_stale": stale_claim.attempt},
+                reason="j_stale first crash",
+            )
+            == 1
+        )
+        stale_reclaim = queue.dequeue()
+        assert stale_reclaim is not None and stale_reclaim.attempt == 1
+        queue.mark_processing("j_stale", generation=stale_reclaim.attempt)
+
+        # Batch where the supervisor holds a stale gen-0 view of j_stale but
+        # the correct generation-0 view of j_live.
+        recovered = queue.recover_claimed_jobs(
+            ["j_stale", "j_live"],
+            generation_by_id={"j_stale": 0, "j_live": live_claim.attempt},
+            reason="supervisor batch after confirmed deaths",
+        )
+        assert recovered == 1
+        assert queue.get_status("j_stale") == "processing"
+        assert queue.get_status("j_live") == "queued"
+
+    with raw_connect(db_path) as conn:
+        stale_events = conn.execute(
+            "SELECT COUNT(*) FROM job_events WHERE job_id = 'j_stale'"
+        ).fetchone()[0]
+        live_events = conn.execute(
+            "SELECT event_type FROM job_events WHERE job_id = 'j_live'"
+        ).fetchall()
+    # j_stale keeps only its first recovery event; the stale batch entry
+    # added nothing. j_live got exactly its one genuine requeue event.
+    assert stale_events == 1
+    assert [row["event_type"] for row in live_events] == ["job_requeued"]
+
+
+def test_recovery_rejects_invalid_generation_values(tmp_path: Path) -> None:
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(make_job("j1"))
+        claim = queue.dequeue()
+        assert claim is not None
+        for bad_generation in (-1, 1.5, True, "0"):
+            with pytest.raises((ValueError, TypeError)):
+                queue.recover_claimed_jobs(
+                    ["j1"],
+                    generation_by_id={"j1": bad_generation},  # type: ignore[dict-item]
+                    reason="invalid fencing token",
+                )
+        # The rejected calls changed nothing.
+        assert queue.get_status("j1") == "assigned"
 
 
 def test_no_automatic_time_based_rescheduling_exists(tmp_path: Path) -> None:

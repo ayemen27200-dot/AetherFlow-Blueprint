@@ -20,6 +20,9 @@ Every claim reads the row's ``retry_count`` and exposes it as
 generation; the UPDATE is guarded by ``retry_count = ?``. When a job is
 recovered and re-claimed its generation changes, so a stale worker still
 holding the old generation can never overwrite the new worker's state.
+Recovery is fenced the same way: :meth:`recover_claimed_jobs` requires the
+supervisor's observed generation per job and treats every mismatch as a
+no-op, so a stale recovery notification can never reschedule a newer claim.
 
 Crash recovery — evidence only, no time-based guessing
 ------------------------------------------------------
@@ -59,7 +62,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -408,7 +411,10 @@ class SQLiteQueue:
           ``D2_MVP/02_IMPLEMENTATION_MAP.md``) are token-validated only and
           never touch the filesystem.
 
-        The two channels are mutually exclusive.
+        The two channels are mutually exclusive. ``None`` means "no input
+        reference" and is allowed; an empty-string ``input_path`` is
+        malformed input and rejected before any database write, whether it
+        arrives alone or alongside an ``upload_id``.
         """
         if not isinstance(job, QueuedJob):
             raise TypeError("enqueue expects a QueuedJob instance")
@@ -416,7 +422,12 @@ class SQLiteQueue:
             raise ValueError("QueuedJob.id and QueuedJob.type must be non-empty")
         if not 0 <= job.priority <= 10:
             raise ValueError("priority must be between 0 and 10")
-        if job.input_path and job.upload_id:
+        if job.input_path == "":
+            raise InvalidJobInputError(
+                "QueuedJob.input_path must be a non-empty filesystem path or "
+                "None; an empty string is malformed input and cannot be enqueued"
+            )
+        if job.input_path is not None and job.upload_id is not None:
             raise ValueError(
                 "QueuedJob.input_path and upload_id are mutually exclusive"
             )
@@ -425,7 +436,7 @@ class SQLiteQueue:
         if job.upload_id is not None:
             validate_upload_id(job.upload_id)
             stored_input = _UPLOAD_PREFIX + job.upload_id
-        elif job.input_path:
+        elif job.input_path is not None:
             # Fail closed: no policy, or a policy without a proven trusted
             # root, means local paths cannot be accepted at all.
             if self._enqueue_policy is None:
@@ -601,6 +612,7 @@ class SQLiteQueue:
         self,
         job_ids: Sequence[str],
         *,
+        generation_by_id: Mapping[str, int],
         reason: str,
         max_retries: int = _DEFAULT_MAX_RETRIES,
     ) -> int:
@@ -613,6 +625,18 @@ class SQLiteQueue:
 
         * ``job_ids`` must name jobs whose worker a *trusted supervisor* has
           already declared dead through external evidence.
+        * ``generation_by_id`` maps every named job to the claim generation
+          (``QueuedJob.attempt`` / ``retry_count``) that the supervisor
+          observed when it confirmed the death. Each row is changed by an
+          atomic compare-and-swap whose ``WHERE`` clause requires both
+          ``retry_count = expected_generation`` and a current
+          ``assigned``/``processing`` status. A job whose current generation
+          differs — typically because it was already recovered and re-claimed
+          by a newer worker — is a **documented no-op**: its state is left
+          untouched, no ``job_events`` row is written, and it is not counted.
+          The same applies to jobs that are no longer in a claimed state.
+          This fencing is what makes a duplicated/stale recovery notification
+          unable to reschedule a newer worker's claim.
         * ``reason`` is a free-text **audit annotation**, recorded verbatim
           into ``job_events``; it is never parsed or verified as liveness
           evidence, and supplying a string does not by itself justify
@@ -625,15 +649,38 @@ class SQLiteQueue:
         Jobs still within the retry budget return to ``queued`` with
         ``retry_count`` incremented and ``started_at`` cleared, making them
         claimable again under a new generation; jobs at/over ``max_retries``
-        become ``failed``. Every decision is appended to ``job_events``. Jobs
-        that are not currently claimed are left untouched. Returns the number
-        of recovered rows.
+        become ``failed``. An event is appended to ``job_events`` only for
+        rows whose fenced update actually succeeded. Unknown job ids raise
+        :class:`JobNotFoundError`; a missing or invalid generation mapping
+        raises :class:`ValueError`/``TypeError`` before any write. Returns the
+        number of recovered rows.
         """
         ids = tuple(job_ids)
         if not ids:
             raise ValueError("job_ids must not be empty")
         if not reason or not reason.strip():
             raise ValueError("an explicit, non-empty recovery reason is required")
+        if not isinstance(generation_by_id, Mapping):
+            raise TypeError(
+                "generation_by_id must map each job id to the supervisor's "
+                "observed claim generation"
+            )
+        missing_generations = sorted(set(ids) - set(generation_by_id))
+        if missing_generations:
+            raise ValueError(
+                "missing expected claim generation for jobs: "
+                + ", ".join(missing_generations)
+            )
+        for job_id in ids:
+            generation = generation_by_id[job_id]
+            if isinstance(generation, bool) or not isinstance(generation, int):
+                raise ValueError(
+                    f"expected generation for {job_id!r} must be an integer"
+                )
+            if generation < 0:
+                raise ValueError(
+                    f"expected generation for {job_id!r} must be non-negative"
+                )
 
         with self._immediate() as conn:
             found = {
@@ -647,53 +694,80 @@ class SQLiteQueue:
             if missing:
                 raise JobNotFoundError(f"unknown jobs: {', '.join(missing)}")
 
-            claimed = conn.execute(
-                f"""
-                SELECT id, status, retry_count
-                FROM jobs
-                WHERE id IN ({', '.join('?' for _ in ids)})
-                  AND status IN (?, ?)
-                """,
-                (*ids, _STATUS_ASSIGNED, _STATUS_PROCESSING),
-            ).fetchall()
-            if not claimed:
-                return 0
+            # Snapshot of currently claimed rows, used only to enrich the
+            # audit payload. The per-row UPDATE below is the fencing
+            # authority: it is itself conditioned on the supervisor's
+            # expected generation, so this read can never cause a newer claim
+            # to be recovered (the reserved write lock prevents any change
+            # between the snapshot and the update anyway).
+            claimed = {
+                row["id"]: row
+                for row in conn.execute(
+                    f"""
+                    SELECT id, status, retry_count
+                    FROM jobs
+                    WHERE id IN ({', '.join('?' for _ in ids)})
+                      AND status IN (?, ?)
+                    """,
+                    (*ids, _STATUS_ASSIGNED, _STATUS_PROCESSING),
+                ).fetchall()
+            }
 
-            claimed_ids = tuple(row["id"] for row in claimed)
-            cursor = conn.execute(
-                f"""
-                UPDATE jobs
-                SET status = CASE
-                        WHEN retry_count >= ? THEN 'failed'
-                        ELSE 'queued'
-                    END,
-                    retry_count = retry_count + 1,
-                    started_at = NULL
-                WHERE id IN ({', '.join('?' for _ in claimed_ids)})
-                """,
-                (max_retries, *claimed_ids),
-            )
+            recovered = 0
+            for job_id in ids:
+                expected_generation = generation_by_id[job_id]
+                row = claimed.get(job_id)
+                if row is None or row["retry_count"] != expected_generation:
+                    # No longer claimed, or a stale supervisor generation:
+                    # leave the newer worker's state alone and stay silent.
+                    continue
 
-            for row in claimed:
-                will_fail = row["retry_count"] >= max_retries
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = CASE
+                            WHEN retry_count >= ? THEN 'failed'
+                            ELSE 'queued'
+                        END,
+                        retry_count = retry_count + 1,
+                        started_at = NULL
+                    WHERE id = ?
+                      AND retry_count = ?
+                      AND status IN (?, ?)
+                    """,
+                    (
+                        max_retries,
+                        job_id,
+                        expected_generation,
+                        _STATUS_ASSIGNED,
+                        _STATUS_PROCESSING,
+                    ),
+                )
+                # The BEGIN IMMEDIATE write lock is held for this whole
+                # transaction and the snapshot above already matched this id,
+                # generation and claimed status, so this UPDATE always changes
+                # exactly one row; no separate rowcount branch is needed.
+
+                will_fail = expected_generation >= max_retries
                 conn.execute(
                     """
                     INSERT INTO job_events (job_id, event_type, payload_json)
                     VALUES (?, ?, ?)
                     """,
                     (
-                        row["id"],
+                        job_id,
                         "job_failed" if will_fail else "job_requeued",
                         json.dumps(
                             {
                                 "reason": reason,
                                 "previous_status": row["status"],
-                                "attempt": row["retry_count"],
+                                "attempt": expected_generation,
                             }
                         ),
                     ),
                 )
-            return cursor.rowcount
+                recovered += 1
+            return recovered
 
     def close(self) -> None:
         """Close the underlying database connection."""

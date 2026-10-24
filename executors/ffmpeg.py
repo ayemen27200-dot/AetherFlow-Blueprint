@@ -5,8 +5,11 @@ Implements the D2 contract in ``D2_MVP/03_FFMPEG_EXECUTOR.md``:
 * every filesystem path is absolute, symlink-resolved and checked against an
   explicit trusted base directory — the executor fails closed when no base is
   configured, mirroring the queue's local-path policy;
-* the input is probed with ``ffprobe`` when available (or a documented
-  FFmpeg-based fallback) before any progress percentage can be computed;
+* media validation has two independent parts: a duration probe (ffprobe
+  JSON when available, otherwise an FFmpeg banner/null-decode fallback) and
+  a separate full null-decode pass. Readable metadata alone never implies
+  decodability — the decode must exit 0 with an empty error stream, and the
+  same rule is applied to every output part;
 * FFmpeg is invoked through ``subprocess`` with an argv list only
   (``shell=True`` is never used), a bounded timeout and process-group
   termination on timeout/cancellation;
@@ -329,7 +332,15 @@ class FFmpegSplitExecutor(Executor):
         return MediaInfo(duration_sec=info.duration_sec, decodable=True)
 
     def _decode_media(self, path: Path) -> bool:
-        """Decode the complete media stream with a bounded FFmpeg subprocess."""
+        """Decode the complete media stream with a bounded FFmpeg subprocess.
+
+        A zero exit code alone is not evidence of decodability: FFmpeg can
+        exit 0 while flooding stderr with decode errors (verified against a
+        header-intact, content-corrupt fixture whose duration metadata stays
+        readable). Success therefore requires both exit code 0 and an empty
+        error-level stderr stream; ``-xerror`` additionally turns the first
+        decode error into a nonzero exit as defence in depth.
+        """
         if not self.ffmpeg_cmd:
             return False
         try:
@@ -340,6 +351,7 @@ class FFmpegSplitExecutor(Executor):
                     "-nostdin",
                     "-v",
                     "error",
+                    "-xerror",
                     "-i",
                     str(path),
                     "-f",
@@ -353,7 +365,7 @@ class FFmpegSplitExecutor(Executor):
             )
         except (OSError, subprocess.SubprocessError):
             return False
-        return completed.returncode == 0
+        return completed.returncode == 0 and not completed.stderr.strip()
 
     def _probe_with_ffprobe(self, path: Path) -> MediaInfo | None:
         try:

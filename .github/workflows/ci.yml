@@ -58,4 +58,8 @@ jobs:
         run: ruff check .
 
       - name: Run test suite
-        run: pytest -q
+        env:
+          # Hard-fail (via tests/integration/test_media_toolchain.py) instead
+          # of silently skipping the real media tests if a binary is missing.
+          AETHERFLOW_REQUIRE_MEDIA_BINARIES: "1"
+        run: pytest -q -ra

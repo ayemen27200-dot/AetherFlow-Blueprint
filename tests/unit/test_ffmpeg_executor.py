@@ -238,18 +238,77 @@ def test_probe_prefers_ffprobe_json(
     executor: FFmpegSplitExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     media = make_media(tmp_path)
-    captured: dict[str, object] = {}
+    calls: list[list[str]] = []
 
     def fake_run(argv, **kwargs):
-        captured["argv"] = argv
-        return subprocess.CompletedProcess(
-            argv, 0, stdout='{"format": {"duration": "5.0"}}', stderr=""
-        )
+        calls.append(argv)
+        if argv[0] == "/usr/bin/ffprobe":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"format": {"duration": "5.0"}}', stderr=""
+            )
+        # Dedicated decode call must carry -xerror and report a clean stream.
+        assert "-xerror" in argv and "null" in argv
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     monkeypatch.setattr(ffmpeg_mod.subprocess, "run", fake_run)
     info = executor.probe(media)
     assert info == MediaInfo(duration_sec=5.0, decodable=True)
-    assert captured["argv"][0] == "/usr/bin/ffprobe"
+    # Metadata probe first, then an independent decode pass — never merged.
+    assert [call[0] for call in calls] == ["/usr/bin/ffprobe", "/usr/bin/ffmpeg"]
+
+
+def test_probe_rejects_file_when_metadata_ok_but_decode_emits_errors(
+    executor: FFmpegSplitExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Audit regression: ffprobe-readable headers with corrupt coded content.
+    # FFmpeg can exit 0 while emitting decode errors, so an empty error stream
+    # is required rather than trusting the exit code alone.
+    media = make_media(tmp_path)
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "/usr/bin/ffprobe":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"format": {"duration": "5.0"}}', stderr=""
+            )
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="", stderr="[h264] Invalid NAL unit size\n"
+        )
+
+    monkeypatch.setattr(ffmpeg_mod.subprocess, "run", fake_run)
+    with pytest.raises(ExecutorInputError, match="could not be validated"):
+        executor.probe(media)
+
+
+def test_probe_rejects_file_when_metadata_ok_but_decode_exits_nonzero(
+    executor: FFmpegSplitExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media = make_media(tmp_path)
+
+    def fake_run(argv, **kwargs):
+        if argv[0] == "/usr/bin/ffprobe":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"format": {"duration": "5.0"}}', stderr=""
+            )
+        return subprocess.CompletedProcess(argv, 183, stdout="", stderr="decode failed")
+
+    monkeypatch.setattr(ffmpeg_mod.subprocess, "run", fake_run)
+    with pytest.raises(ExecutorInputError, match="could not be validated"):
+        executor.probe(media)
+
+
+def test_decode_media_is_bounded_by_probe_timeout(
+    executor: FFmpegSplitExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media = make_media(tmp_path)
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ffmpeg_mod.subprocess, "run", fake_run)
+    assert executor._decode_media(media) is True
+    assert seen["timeout"] == executor.probe_timeout_sec
 
 
 def test_probe_falls_back_to_ffmpeg_when_ffprobe_fails(
@@ -275,7 +334,13 @@ def test_probe_falls_back_to_ffmpeg_when_ffprobe_fails(
     monkeypatch.setattr(ffmpeg_mod.subprocess, "run", fake_run)
     info = executor.probe(media)
     assert info.duration_sec == 5.0 and info.decodable is True
-    assert [call[0] for call in calls] == ["/usr/bin/ffprobe", "/usr/bin/ffmpeg", "/usr/bin/ffmpeg"]
+    # ffprobe fail -> ffmpeg fallback (decode + banner) -> dedicated decode.
+    assert [call[0] for call in calls] == [
+        "/usr/bin/ffprobe",
+        "/usr/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+    ]
 
 
 def test_probe_corrupt_media_raises(

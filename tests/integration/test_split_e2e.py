@@ -191,6 +191,51 @@ def test_corrupt_media_is_rejected_by_probe(tmp_path: Path) -> None:
         )
 
 
+def _corrupt_content_keep_container(path: Path) -> Path:
+    """Zero a middle byte range: container headers/duration stay readable,
+    while the coded frames become undecodable."""
+    data = bytearray(path.read_bytes())
+    middle = len(data) // 2
+    data[middle : middle + 4096] = b"\x00" * 4096
+    target = path.with_name("header_intact_content_corrupt.mp4")
+    target.write_bytes(data)
+    return target
+
+
+def test_decode_media_distinguishes_good_from_header_intact_corrupt(
+    tmp_path: Path,
+) -> None:
+    source = _copy_fixture(tmp_path)
+    corrupt = _corrupt_content_keep_container(source)
+    executor = _make_executor(tmp_path)
+
+    # Premise of the regression: duration metadata remains readable on both
+    # files, so metadata alone cannot tell them apart.
+    if executor.ffprobe_cmd:
+        corrupt_metadata = executor._probe_with_ffprobe(corrupt)
+    else:
+        corrupt_metadata = executor._probe_with_ffmpeg(corrupt)
+    assert corrupt_metadata is not None and corrupt_metadata.duration_sec > 0
+
+    # The dedicated full decode pass is what separates them.
+    assert executor._decode_media(source) is True
+    assert executor._decode_media(corrupt) is False
+
+
+def test_header_intact_but_content_corrupt_media_is_rejected(tmp_path: Path) -> None:
+    source = _copy_fixture(tmp_path)
+    corrupt = _corrupt_content_keep_container(source)
+    executor = _make_executor(tmp_path)
+
+    with pytest.raises(ExecutorInputError, match="could not be validated"):
+        executor.run(
+            {"job_id": "job-corrupt-stream", "input_path": str(corrupt)},
+            lambda _: None,
+        )
+    # Partial output from a rejected job must not remain on disk.
+    assert not (tmp_path / "outbox" / "job-corrupt-stream").exists()
+
+
 def test_timeout_terminates_real_subprocess(tmp_path: Path) -> None:
     source = _copy_fixture(tmp_path)
     executor = _make_executor(tmp_path, timeout_sec=0.001)

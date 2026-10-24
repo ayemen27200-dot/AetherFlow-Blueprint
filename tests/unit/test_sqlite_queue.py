@@ -6,6 +6,7 @@ no production data, network access or paid resources are involved.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -14,16 +15,21 @@ import pytest
 
 from orchestrator.queue import (
     EnqueuePolicy,
+    InvalidJobInputError,
     InvalidJobStateError,
+    InvalidUploadIdError,
     JobAlreadyExistsError,
     JobInputNotFoundError,
     JobInputPathNotAllowedError,
+    JobInputPolicyNotConfiguredError,
     JobInputTooLargeError,
+    JobInputTrustedRootNotConfiguredError,
     JobInputTypeNotAllowedError,
     JobNotFoundError,
     QueuedJob,
     SQLiteQueue,
     validate_job_input,
+    validate_upload_id,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -207,8 +213,9 @@ def test_policy_loads_project_limits_from_transfer_spec() -> None:
     assert policy.allowed_extensions == frozenset(
         {".mp4", ".mkv", ".mov", ".mp3", ".wav", ".m4a"}
     )
-    # The project defines no trusted input directory yet; containment cannot
-    # be claimed as enforced until that setting exists.
+    # The project defines no trusted input directory yet; with base dir None
+    # the queue fails closed and rejects every local path until an explicit
+    # trusted root is supplied to from_file_transfer_spec().
     assert policy.allowed_base_dir is None
 
 
@@ -282,35 +289,147 @@ def test_enqueue_rejects_oversized_file_before_insert(tmp_path: Path) -> None:
         assert queue.size() == 0
 
 
-def test_policy_without_base_dir_still_enforces_existence_type_size(
+def test_local_path_without_policy_is_rejected_before_any_write(
     tmp_path: Path,
 ) -> None:
-    # Documented gap mode: no trusted dir is configured, so containment is
-    # not checkable; the other static checks must still run.
-    policy = EnqueuePolicy(
-        max_file_size_bytes=10,
+    # Fail-closed: a local path must never be accepted just because no
+    # validation policy was configured.
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    media = incoming / "clip.mp4"
+    media.write_bytes(b"synthetic")
+    db_path = tmp_path / "q.db"
+
+    with SQLiteQueue(db_path) as queue:
+        with pytest.raises(JobInputPolicyNotConfiguredError):
+            queue.enqueue(make_job("j1", input_path=str(media)))
+        # The rejection happens before the INSERT: no row exists.
+        assert queue.size() == 0
+        assert queue.get("j1") is None
+
+    with raw_connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_local_path_is_rejected_when_trusted_root_is_not_configured(
+    tmp_path: Path,
+) -> None:
+    # A policy without an explicit allowed_base_dir cannot prove containment,
+    # so it must reject local paths rather than partially validate them.
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    media = incoming / "clip.mp4"
+    media.write_bytes(b"synthetic")
+    rootless_policy = EnqueuePolicy(
+        max_file_size_bytes=1024,
         allowed_extensions=frozenset({".mp4"}),
         allowed_base_dir=None,
     )
-    anywhere = tmp_path / "anywhere.mp4"
-    anywhere.write_bytes(b"12345")
-    assert validate_job_input(anywhere, policy) == anywhere.resolve()
 
-    oversized = tmp_path / "big.mp4"
-    oversized.write_bytes(b"x" * 11)
-    with pytest.raises(JobInputTooLargeError):
-        validate_job_input(oversized, policy)
+    with pytest.raises(JobInputTrustedRootNotConfiguredError):
+        validate_job_input(media, rootless_policy)
+
+    with SQLiteQueue(tmp_path / "q.db", enqueue_policy=rootless_policy) as queue:
+        with pytest.raises(JobInputTrustedRootNotConfiguredError):
+            queue.enqueue(make_job("j1", input_path=str(media)))
+        assert queue.size() == 0
 
 
-def test_enqueue_without_policy_keeps_backward_compatible_behaviour(
+def test_symlink_escaping_trusted_root_is_rejected(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    outside_dir = tmp_path / "elsewhere"
+    outside_dir.mkdir()
+    target = outside_dir / "clip.mp4"
+    target.write_bytes(b"synthetic")
+    # The link itself sits inside the trusted root but points outside.
+    link = incoming / "link.mp4"
+    link.symlink_to(target)
+    policy = make_policy(incoming)
+
+    with SQLiteQueue(tmp_path / "q.db", enqueue_policy=policy) as queue:
+        with pytest.raises(JobInputPathNotAllowedError):
+            queue.enqueue(make_job("j1", input_path=str(link)))
+        assert queue.size() == 0
+
+
+def test_all_path_rejections_leave_no_database_row(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    policy = make_policy(incoming, max_bytes=10)
+    db_path = tmp_path / "q.db"
+
+    cases = (
+        incoming / "missing.mp4",  # nonexistent
+        incoming / "notes.txt",  # disallowed extension
+    )
+    (incoming / "notes.txt").write_text("x")
+    oversized = incoming / "big.mp4"
+    oversized.write_bytes(b"x" * 50)
+
+    with SQLiteQueue(db_path, enqueue_policy=policy) as queue:
+        for index, path in enumerate((*cases, oversized)):
+            with pytest.raises(InvalidJobInputError):
+                queue.enqueue(make_job(f"j{index}", input_path=str(path)))
+        assert queue.size() == 0
+
+    with raw_connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Opaque upload ids (remote API flow) — never treated as filesystem paths
+# --------------------------------------------------------------------------- #
+
+
+def test_upload_id_is_accepted_without_policy_and_never_hits_filesystem(
     tmp_path: Path,
 ) -> None:
-    # Queues without an injected policy (e.g. opaque upload-id jobs) behave
-    # exactly as before; filesystem validation is opt-in via configuration.
+    # No policy, no files on disk: an opaque id is a token, not a path.
     with SQLiteQueue(tmp_path / "q.db") as queue:
-        queue.enqueue(make_job("j1", input_path=None))
-        queue.enqueue(make_job("j2", input_path="/nonexistent/local/path.mp4"))
-        assert queue.size() == 2
+        queue.enqueue(QueuedJob(id="j1", type="split", upload_id="up-123_ABC.42"))
+        claimed = queue.dequeue()
+        assert claimed is not None
+        assert claimed.upload_id == "up-123_ABC.42"
+        assert claimed.input_path is None
+
+    with raw_connect(tmp_path / "q.db") as conn:
+        stored = conn.execute(
+            "SELECT input_path FROM jobs WHERE id = 'j1'"
+        ).fetchone()[0]
+        assert stored == "upload://up-123_ABC.42"
+
+
+def test_upload_id_rejects_path_like_or_malformed_tokens() -> None:
+    for bad in ("", "a/b", "../etc/passwd", "a\\b", "up#1", "x" * 129, "a b"):
+        with pytest.raises(InvalidUploadIdError):
+            validate_upload_id(bad)
+    for good in ("up-1", "abc123", "UPLOAD.123_x-1"):
+        assert validate_upload_id(good) == good
+
+
+def test_input_path_and_upload_id_are_mutually_exclusive(tmp_path: Path) -> None:
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            queue.enqueue(
+                QueuedJob(
+                    id="j1",
+                    type="split",
+                    input_path="/tmp/x.mp4",
+                    upload_id="up-1",
+                )
+            )
+        assert queue.size() == 0
+
+
+def test_jobs_without_any_input_reference_remain_supported(tmp_path: Path) -> None:
+    # Internal/local scaffolding jobs may carry neither channel yet.
+    with SQLiteQueue(tmp_path / "q.db") as queue:
+        queue.enqueue(make_job("j1"))
+        claimed = queue.dequeue()
+        assert claimed is not None
+        assert claimed.input_path is None
+        assert claimed.upload_id is None
 
 
 # --------------------------------------------------------------------------- #
@@ -385,7 +504,10 @@ def test_stale_generation_cannot_drive_transitions(tmp_path: Path) -> None:
         assert second.attempt == first.attempt + 1
         queue.mark_processing("j1", generation=second.attempt)
 
-        # The old worker waking up must not overwrite the new claim.
+        # The old worker waking up must not overwrite the new claim: every
+        # transition guarded by its stale generation is rejected.
+        with pytest.raises(InvalidJobStateError):
+            queue.mark_processing("j1", generation=first.attempt)
         with pytest.raises(InvalidJobStateError):
             queue.mark_completed("j1", generation=first.attempt)
         with pytest.raises(InvalidJobStateError):
@@ -434,7 +556,12 @@ def test_recover_claimed_jobs_requeues_with_audit_event(tmp_path: Path) -> None:
             "SELECT event_type, payload_json FROM job_events WHERE job_id = 'j1'"
         ).fetchone()
         assert event["event_type"] == "job_requeued"
-        assert "heartbeat lost" in event["payload_json"]
+        payload = json.loads(event["payload_json"])
+        # ``reason`` is audit text stored verbatim; the queue never parses
+        # or verifies it as liveness evidence.
+        assert payload["reason"] == "heartbeat lost: environment offline"
+        assert payload["previous_status"] == "processing"
+        assert payload["attempt"] == 0
 
 
 def test_recover_fails_job_after_retry_budget_exhausted(tmp_path: Path) -> None:
@@ -519,6 +646,21 @@ def test_no_automatic_time_based_rescheduling_exists(tmp_path: Path) -> None:
     with SQLiteQueue(db_path) as restarted:
         assert restarted.get_status("old_job") == "processing"
         assert restarted.size() == 0
+
+
+def test_recovery_has_no_automatic_call_site() -> None:
+    # Regression guard: recovery must stay an explicit supervisor decision.
+    # No production module may invoke recover_claimed_jobs itself.
+    package = REPO_ROOT / "orchestrator"
+    callers: list[str] = []
+    for source in package.rglob("*.py"):
+        text = source.read_text(encoding="utf-8")
+        if "recover_claimed_jobs" in text and "def recover_claimed_jobs" not in text:
+            callers.append(str(source.relative_to(REPO_ROOT)))
+    assert callers == [], f"unexpected automatic recovery callers: {callers}"
+    # The definition itself lives exactly once, in the queue module.
+    queue_source = (package / "queue.py").read_text(encoding="utf-8")
+    assert queue_source.count("def recover_claimed_jobs") == 1
 
 
 # --------------------------------------------------------------------------- #

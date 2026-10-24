@@ -38,6 +38,18 @@ mechanism is D3 work and does not exist yet; until it is implemented, no
 automatic rescheduling runs anywhere in the queue. Each recovery is recorded
 in ``job_events`` with the supplied reason.
 
+Input validation — fail closed
+------------------------------
+Local filesystem paths (``QueuedJob.input_path``, the trusted local CLI flow)
+are accepted only when the queue holds an :class:`EnqueuePolicy` whose
+``allowed_base_dir`` is set explicitly; the symlink-resolved real file must
+live inside that root and pass the extension/size limits loaded from
+``config/file_transfer_spec.yaml``. With no policy, or no trusted root, every
+local path is rejected before any database write. Remote API jobs never send
+paths: they carry an opaque ``QueuedJob.upload_id`` (the ``POST /uploads``
+contract in ``D2_MVP/02_IMPLEMENTATION_MAP.md``) which is token-validated and
+never passed to filesystem APIs.
+
 Each worker/thread should open its own ``SQLiteQueue`` instance; the wrapped
 sqlite3 connection is not shared across threads by design.
 """
@@ -45,6 +57,7 @@ sqlite3 connection is not shared across threads by design.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -104,6 +117,14 @@ _STATUS_FAILED = "failed"
 _CLAIMED_STATUSES = (_STATUS_ASSIGNED, _STATUS_PROCESSING)
 _DEFAULT_MAX_RETRIES = 3
 
+# Internal storage convention for opaque remote upload ids. The canonical D1
+# schema has only an ``input_path`` column, so an upload id is persisted there
+# with this prefix and never handed to filesystem APIs.
+_UPLOAD_PREFIX = "upload://"
+# Opaque server-issued ids are bounded tokens with no path semantics: no
+# separators, no parent references, no NUL characters.
+_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
 
 class QueueError(Exception):
     """Base error for queue operations."""
@@ -141,6 +162,26 @@ class JobInputTooLargeError(InvalidJobInputError):
     """Raised when the input file exceeds the configured size limit."""
 
 
+class JobInputPolicyNotConfiguredError(InvalidJobInputError):
+    """Raised when a local path is enqueued without a validation policy.
+
+    Fail-closed guard: local filesystem paths are never accepted on the
+    assumption that validation is unnecessary.
+    """
+
+
+class JobInputTrustedRootNotConfiguredError(InvalidJobInputError):
+    """Raised when the policy cannot identify a trusted root directory.
+
+    Without an explicit ``allowed_base_dir`` path containment cannot be
+    proven, so local paths are rejected rather than partially validated.
+    """
+
+
+class InvalidUploadIdError(InvalidJobInputError):
+    """Raised when an opaque upload id has path-like or malformed content."""
+
+
 @dataclass(frozen=True)
 class EnqueuePolicy:
     """Static input validation policy sourced from project configuration.
@@ -150,11 +191,13 @@ class EnqueuePolicy:
 
     ``allowed_base_dir`` is the only trusted root for local input paths. The
     project currently defines no such directory anywhere in its configuration,
-    so it defaults to ``None``: in that mode path containment cannot be
-    enforced (existence, extension and size still are). The missing setting
-    must be added to the configuration before enabling untrusted local paths;
-    remote API clients never send filesystem paths at all — they use opaque
-    upload ids per ``D2_MVP/02_IMPLEMENTATION_MAP.md``.
+    so it defaults to ``None`` and the queue then **rejects every local
+    ``input_path``** (fail closed): partial validation without proven
+    containment is not accepted. A trusted root must be configured explicitly
+    (deployment configuration, not a hard-coded guess) before local CLI paths
+    can be enqueued. Remote API clients never send filesystem paths — they use
+    opaque upload ids per ``D2_MVP/02_IMPLEMENTATION_MAP.md``, which take the
+    separate :attr:`QueuedJob.upload_id` channel and need no policy.
     """
 
     max_file_size_bytes: int
@@ -187,21 +230,30 @@ class EnqueuePolicy:
 def validate_job_input(path: str | Path, policy: EnqueuePolicy) -> Path:
     """Validate a local input path against the policy before enqueue.
 
-    Performs the static checks available without FFprobe: existence, trusted
-    directory containment, allowed extension and size limit. Media-structure
-    validation (FFprobe/MIME) remains a separate runtime requirement noted in
+    Fails closed when the policy has no explicit trusted root. Otherwise
+    performs the static checks available without FFprobe, all against the
+    symlink-resolved real path: existence, trusted-directory containment,
+    allowed extension and size limit. Media-structure validation
+    (FFprobe/MIME) remains a separate runtime requirement noted in
     ``config/file_transfer_spec.yaml``.
     """
+    if policy.allowed_base_dir is None:
+        raise JobInputTrustedRootNotConfiguredError(
+            "an explicit allowed_base_dir is required before local input "
+            "paths can be validated; configure a trusted input directory"
+        )
+
+    # resolve() follows symlinks, so a link placed inside the trusted root but
+    # pointing outside it is evaluated against its real target location.
     candidate = Path(path).expanduser().resolve()
+    base = policy.allowed_base_dir.expanduser().resolve()
+    if not candidate.is_relative_to(base):
+        raise JobInputPathNotAllowedError(
+            f"input path {candidate} is outside the allowed directory {base}"
+        )
+
     if not candidate.is_file():
         raise JobInputNotFoundError(f"input file does not exist: {candidate}")
-
-    if policy.allowed_base_dir is not None:
-        base = policy.allowed_base_dir.expanduser().resolve()
-        if not candidate.is_relative_to(base):
-            raise JobInputPathNotAllowedError(
-                f"input path {candidate} is outside the allowed directory {base}"
-            )
 
     if candidate.suffix.lower() not in policy.allowed_extensions:
         raise JobInputTypeNotAllowedError(
@@ -216,6 +268,22 @@ def validate_job_input(path: str | Path, policy: EnqueuePolicy) -> Path:
             f"{policy.max_file_size_bytes} bytes"
         )
     return candidate
+
+
+def validate_upload_id(upload_id: str) -> str:
+    """Validate an opaque remote upload id without touching the filesystem.
+
+    Upload ids are server-issued tokens (see ``POST /uploads`` in the OpenAPI
+    contract), never paths. Path separators, parent references and control
+    characters are rejected so an id can never be reinterpreted as a local
+    filesystem location.
+    """
+    if not isinstance(upload_id, str) or not _UPLOAD_ID_RE.fullmatch(upload_id):
+        raise InvalidUploadIdError(
+            "upload id must be 1-128 characters from [A-Za-z0-9._-] with no "
+            "path separators or parent references"
+        )
+    return upload_id
 
 
 @dataclass(frozen=True)
@@ -233,6 +301,7 @@ class QueuedJob:
     priority: int = 5
     created_at: str = ""
     input_path: str | None = None
+    upload_id: str | None = None
     cloud_consent: bool = False
     attempt: int = 0
 
@@ -287,12 +356,25 @@ class SQLiteQueue:
 
     @staticmethod
     def _to_job(row: sqlite3.Row) -> QueuedJob:
+        stored = row["input_path"]
+        if isinstance(stored, str) and stored.startswith(_UPLOAD_PREFIX):
+            return QueuedJob(
+                id=row["id"],
+                type=row["type"],
+                priority=row["priority"],
+                created_at=row["created_at"] or "",
+                input_path=None,
+                upload_id=stored[len(_UPLOAD_PREFIX) :],
+                cloud_consent=bool(row["cloud_consent"]),
+                attempt=int(row["retry_count"]),
+            )
         return QueuedJob(
             id=row["id"],
             type=row["type"],
             priority=row["priority"],
             created_at=row["created_at"] or "",
-            input_path=row["input_path"],
+            input_path=stored,
+            upload_id=None,
             cloud_consent=bool(row["cloud_consent"]),
             attempt=int(row["retry_count"]),
         )
@@ -300,8 +382,18 @@ class SQLiteQueue:
     def enqueue(self, job: QueuedJob) -> None:
         """Insert a job in the ``queued`` state using bound parameters.
 
-        When an :class:`EnqueuePolicy` is configured and the job carries a
-        local ``input_path``, the file is validated before any write.
+        Input handling is fail-closed and split into two explicit channels:
+
+        * Local ``input_path`` values require a configured
+          :class:`EnqueuePolicy` with an explicit trusted root; the resolved
+          real file is fully validated *before any SQLite write*. A missing
+          policy or trusted root raises instead of silently accepting the
+          path.
+        * Opaque ``upload_id`` values (remote API flow per
+          ``D2_MVP/02_IMPLEMENTATION_MAP.md``) are token-validated only and
+          never touch the filesystem.
+
+        The two channels are mutually exclusive.
         """
         if not isinstance(job, QueuedJob):
             raise TypeError("enqueue expects a QueuedJob instance")
@@ -309,8 +401,29 @@ class SQLiteQueue:
             raise ValueError("QueuedJob.id and QueuedJob.type must be non-empty")
         if not 0 <= job.priority <= 10:
             raise ValueError("priority must be between 0 and 10")
-        if self._enqueue_policy is not None and job.input_path:
-            validate_job_input(job.input_path, self._enqueue_policy)
+        if job.input_path and job.upload_id:
+            raise ValueError(
+                "QueuedJob.input_path and upload_id are mutually exclusive"
+            )
+
+        stored_input: str | None
+        if job.upload_id is not None:
+            validate_upload_id(job.upload_id)
+            stored_input = _UPLOAD_PREFIX + job.upload_id
+        elif job.input_path:
+            # Fail closed: no policy, or a policy without a proven trusted
+            # root, means local paths cannot be accepted at all.
+            if self._enqueue_policy is None:
+                raise JobInputPolicyNotConfiguredError(
+                    "a local input_path was supplied but the queue has no "
+                    "EnqueuePolicy; configure a policy with an explicit "
+                    "allowed_base_dir or use an opaque upload_id instead"
+                )
+            validated = validate_job_input(job.input_path, self._enqueue_policy)
+            stored_input = str(validated)
+        else:
+            stored_input = None
+
         try:
             with self._immediate() as conn:
                 conn.execute(
@@ -325,7 +438,7 @@ class SQLiteQueue:
                         job.id,
                         job.type,
                         job.priority,
-                        job.input_path,
+                        stored_input,
                         int(job.cloud_consent),
                         job.created_at,
                     ),
@@ -478,12 +591,21 @@ class SQLiteQueue:
     ) -> int:
         """Requeue or fail claimed jobs after the worker is confirmed dead.
 
-        This is the ONLY supported recovery path and it is evidence-driven:
-        the caller (supervisor) passes the explicit ids of jobs whose worker
-        has been declared dead plus an audit ``reason``. There is no wall-clock
-        sweep, because ``started_at`` cannot distinguish a slow-but-alive
-        worker from a dead one. Heartbeat-based liveness is the intended future
-        evidence source (D3); until then callers must not invent evidence.
+        This is the ONLY supported recovery path and it is evidence-driven by
+        the caller, not by this method. The queue has no heartbeat/liveness
+        source yet (that is D3 work feeding ``environments.last_heartbeat``),
+        so it cannot decide by itself that a worker died:
+
+        * ``job_ids`` must name jobs whose worker a *trusted supervisor* has
+          already declared dead through external evidence.
+        * ``reason`` is a free-text **audit annotation**, recorded verbatim
+          into ``job_events``; it is never parsed or verified as liveness
+          evidence, and supplying a string does not by itself justify
+          recovery.
+        * Nothing in this package calls this method automatically — there is
+          no wall-clock sweep, because ``started_at`` cannot distinguish a
+          slow-but-alive worker from a dead one. Invocation is solely the
+          supervisor's responsibility after confirmed worker death.
 
         Jobs still within the retry budget return to ``queued`` with
         ``retry_count`` incremented and ``started_at`` cleared, making them

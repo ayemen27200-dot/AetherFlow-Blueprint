@@ -1,0 +1,63 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+config/config.yaml
+config/secrets.yaml
+*.pem
+*.key
+*.p12
+
+# Media, generated outputs, caches and model weights
+data/
+outputs/
+models/
+*.mp4
+*.mkv
+*.mov
+*.wav
+*.mp3
+!tests/fixtures/sample_5s.mp4
+!tests/fixtures/*.md
+
+# SQLite and application logs
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Node (optional web asset build)
+node_modules/
+web/static/css/app.css.bak
+
+# IDE and operating systems
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+*.tmp

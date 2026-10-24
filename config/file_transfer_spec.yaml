@@ -1,0 +1,49 @@
+# AetherFlow file-transfer contract. Implementations must validate paths and checksums.
+version: 1
+transfers:
+  vps_to_phone:
+    method: rsync_over_ssh
+    rsync_flags: ["-z", "--partial", "--append-verify", "--timeout=300"]
+    concurrency: 1
+    bandwidth_limit_kbps: null
+    retry: {max_attempts: 3, backoff: exponential, base_sec: 5}
+    verification: {post_transfer: sha256_match, on_mismatch: retry_from_scratch}
+  phone_to_vps:
+    method: rsync_over_ssh
+    rsync_flags: ["-z", "--partial", "--append-verify", "--timeout=300"]
+    concurrency: 1
+    retry: {max_attempts: 3, backoff: exponential, base_sec: 5}
+    verification: {post_transfer: sha256_match, on_mismatch: retry_from_scratch}
+  vps_to_modal:
+    method: modal_volume
+    volume_name: aetherflow-inputs
+    mount_path: /inputs
+    upload_strategy: copy_then_call
+    encryption: provider_transport_security
+    cleanup: {trigger: job_completion, delay_hours: 1}
+    note: "Verify current provider transport, storage and billing terms before relying on this value."
+  modal_to_vps:
+    method: modal_volume_download
+    volume_name: aetherflow-outputs
+    download_path: "/data/jobs/{job_id}/"
+    verification: sha256_match
+  vps_to_user:
+    method: http_range_request
+    endpoint: "GET /jobs/{id}/download"
+    chunk_size_mb: 4
+    resume_support: true
+constraints:
+  max_file_size_mb: 2000
+  allowed_extensions: [.mp4, .mkv, .mov, .mp3, .wav, .m4a]
+  allowed_mime_types:
+    - video/mp4
+    - video/x-matroska
+    - video/quicktime
+    - audio/mpeg
+    - audio/wav
+    - audio/mp4
+  rejection_policy: fail_fast_with_reason
+  notes:
+    - MIME and extension checks are only preliminary; validate media structure with FFprobe.
+    - Do not accept arbitrary remote filesystem paths from an untrusted API client.
+    - SHA-256 checksums verify transfer integrity, not authenticity of the original artifact.

@@ -1,0 +1,492 @@
+openapi: 3.1.0
+info:
+  title: AetherFlow API
+  version: 1.0.0
+  description: >-
+    API contract for the AetherFlow distributed video-processing orchestrator.
+    Remote clients must use upload IDs rather than arbitrary server filesystem paths.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: https://your-domain.example
+    description: Replace with the configured production domain.
+  - url: http://localhost:8000
+    description: Local development only.
+tags:
+  - name: Jobs
+  - name: Uploads
+  - name: Accounts
+  - name: Agents
+  - name: Operations
+security:
+  - BearerAuth: []
+paths:
+  /uploads:
+    post:
+      tags: [Uploads]
+      summary: Upload media and receive an opaque upload ID
+      description: Enforce size limits, validate media with FFprobe, and store outside the web root.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          description: Upload accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '413':
+          description: Upload exceeds the configured size limit
+        '415':
+          description: Unsupported media type
+  /jobs:
+    post:
+      tags: [Jobs]
+      summary: Create a processing job
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobSpec'
+      responses:
+        '202':
+          description: Job accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Requested cloud processing is forbidden by consent, tier, or quota policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Upload ID not found
+        '413':
+          description: Media exceeds configured limits
+    get:
+      tags: [Jobs]
+      summary: List jobs
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [queued, assigned, uploading, processing, downloading, completed, failed, cancelled, stalled]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque pagination cursor, if implemented.
+      responses:
+        '200':
+          description: Jobs ordered by priority descending, then creation time ascending
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Job'
+  /jobs/{id}:
+    get:
+      tags: [Jobs]
+      summary: Get job details
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /jobs/{id}/progress:
+    get:
+      tags: [Jobs]
+      summary: Subscribe to job progress using Server-Sent Events
+      description: Use fetch-based streaming when the client must send a Bearer header; do not put bearer tokens in the query string.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Optional event cursor for reconnecting clients.
+      responses:
+        '200':
+          description: Server-Sent Events stream
+          headers:
+            Cache-Control:
+              schema: {type: string, example: no-cache}
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |-
+                event: progress
+                id: 17
+                data: {"progress_pct":45,"stage":"processing"}
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /jobs/{id}/cancel:
+    post:
+      tags: [Jobs]
+      summary: Request best-effort cancellation
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '202':
+          description: Cancellation request accepted
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Job has already reached a terminal state
+  /jobs/{id}/download:
+    get:
+      tags: [Jobs]
+      summary: Download an authorized result
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+        - name: Range
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Optional HTTP byte range for resumable downloads.
+      responses:
+        '200':
+          description: Complete output file
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '206':
+          description: Partial output file
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '416':
+          description: Invalid byte range
+  /accounts:
+    post:
+      tags: [Accounts]
+      summary: Add a provider account
+      description: >-
+        This management operation must be restricted to a trusted local/admin context
+        in addition to authentication. Never log or return the submitted API key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, api_key]
+              properties:
+                provider:
+                  type: string
+                  enum: [modal, vast_ai, groq, gemini, openrouter]
+                api_key:
+                  type: string
+                  minLength: 1
+                  writeOnly: true
+      responses:
+        '201':
+          description: Account metadata created; secret is not returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Operation not allowed from this context
+    get:
+      tags: [Accounts]
+      summary: List provider account metadata without secret values
+      responses:
+        '200':
+          description: Account metadata
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Account'
+  /accounts/{id}:
+    delete:
+      tags: [Accounts]
+      summary: Delete an account and re-evaluate affected jobs
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '204':
+          description: Account deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /agents/{id}/heartbeat:
+    post:
+      tags: [Agents]
+      summary: Agent heartbeat (target cadence 30 seconds)
+      security:
+        - AgentToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Heartbeat'
+      responses:
+        '200': {description: Heartbeat accepted}
+        '401': {description: Invalid agent token}
+        '404': {description: Unknown agent}
+  /agents/{id}/jobs/{job_id}/progress:
+    post:
+      tags: [Agents]
+      summary: Agent reports job progress
+      security:
+        - AgentToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+        - name: job_id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProgressUpdate'
+      responses:
+        '200': {description: Progress update accepted}
+        '401': {description: Invalid agent token}
+        '404': {description: Agent or job not found}
+  /health:
+    get:
+      tags: [Operations]
+      summary: Non-sensitive service health check
+      security: []
+      responses:
+        '200':
+          description: Service responds; status may be degraded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: Required component unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /metrics:
+    get:
+      tags: [Operations]
+      summary: Prometheus metrics endpoint
+      description: Protect at the network layer or with explicit authentication in production.
+      responses:
+        '200':
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema: {type: string}
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+    AgentToken:
+      type: apiKey
+      in: header
+      name: X-Agent-Token
+  parameters:
+    JobId:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, minLength: 1}
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    JobSpec:
+      type: object
+      additionalProperties: false
+      required: [type, file]
+      properties:
+        type:
+          type: string
+          enum: [transcription, text_removal, split]
+        file:
+          type: string
+          minLength: 1
+          description: Opaque upload ID from POST /uploads; never a remote filesystem path.
+        language:
+          type: string
+          default: auto
+          description: ISO language code or auto.
+        environment:
+          type: [string, 'null']
+          enum: [phone, vps, cloud, null]
+        cloud_consent:
+          type: boolean
+          default: false
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 5
+        preset:
+          type: [string, 'null']
+          enum: [fast, balanced, high_quality, null]
+        mask_region:
+          oneOf:
+            - {$ref: '#/components/schemas/MaskRegion'}
+            - {type: 'null'}
+          description: Required for text_removal unless the user explicitly selects a reviewed OCR mask workflow.
+    MaskRegion:
+      type: object
+      additionalProperties: false
+      required: [top, bottom, left, right]
+      description: Normalized rectangle (0..1). bottom must exceed top and right must exceed left.
+      properties:
+        top: {type: number, minimum: 0, maximum: 1}
+        bottom: {type: number, minimum: 0, maximum: 1}
+        left: {type: number, minimum: 0, maximum: 1}
+        right: {type: number, minimum: 0, maximum: 1}
+      examples:
+        - {top: 0.82, bottom: 1.0, left: 0.0, right: 1.0}
+    Job:
+      type: object
+      required: [id, type, status, created_at]
+      properties:
+        id: {type: string}
+        type: {type: string, enum: [transcription, text_removal, split]}
+        status:
+          type: string
+          enum: [queued, assigned, uploading, processing, downloading, completed, failed, cancelled, stalled]
+        environment: {type: [string, 'null'], enum: [phone, vps, cloud, null]}
+        priority: {type: integer, minimum: 0, maximum: 10}
+        progress_pct: {type: number, minimum: 0, maximum: 100}
+        error_type:
+          type: [string, 'null']
+          enum: [NETWORK, OOM, QUOTA_EXCEEDED, INVALID_INPUT, TOOL_ERROR, AUTH_ERROR, CLOUD_FORBIDDEN, TIER_UPGRADE_REQUIRED, null]
+        output_paths:
+          type: array
+          items: {type: string}
+          description: Internal API field; prefer authorized download URLs for remote clients.
+        created_at: {type: string, format: date-time}
+        started_at: {type: [string, 'null'], format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+        retry_count: {type: integer, minimum: 0, default: 0}
+    Upload:
+      type: object
+      required: [upload_id, size_bytes]
+      properties:
+        upload_id: {type: string}
+        size_bytes: {type: integer, minimum: 0}
+        media_type: {type: [string, 'null']}
+        duration_sec: {type: [number, 'null'], minimum: 0}
+    Account:
+      type: object
+      required: [id, provider, enabled]
+      properties:
+        id: {type: string}
+        provider: {type: string, enum: [modal, vast_ai, groq, gemini, openrouter]}
+        enabled: {type: boolean}
+        quota_limit: {type: [integer, 'null'], minimum: 0}
+        quota_used: {type: integer, minimum: 0}
+        quota_reset_at: {type: [string, 'null'], format: date-time}
+    Heartbeat:
+      type: object
+      required: [timestamp, capabilities]
+      properties:
+        timestamp: {type: string, format: date-time}
+        capabilities:
+          type: object
+          properties:
+            ram_available_gb: {type: number, minimum: 0}
+            battery_pct: {type: integer, minimum: 0, maximum: 100}
+            thermal_status: {type: string, enum: [normal, warm, hot, unknown]}
+            storage_free_gb: {type: number, minimum: 0}
+        current_job:
+          oneOf:
+            - {$ref: '#/components/schemas/CurrentJob'}
+            - {type: 'null'}
+    CurrentJob:
+      type: object
+      properties:
+        id: {type: string}
+        progress_pct: {type: number, minimum: 0, maximum: 100}
+    ProgressUpdate:
+      type: object
+      required: [progress_pct, stage]
+      properties:
+        progress_pct: {type: number, minimum: 0, maximum: 100}
+        stage: {type: string, minLength: 1}
+        eta_sec: {type: [integer, 'null'], minimum: 0}
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: {type: string, enum: [ok, degraded, down]}
+        components:
+          type: object
+          additionalProperties: {type: string}
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail: {type: string}
+        error_type:
+          type: [string, 'null']
+          enum: [NETWORK, OOM, QUOTA_EXCEEDED, INVALID_INPUT, TOOL_ERROR, AUTH_ERROR, CLOUD_FORBIDDEN, TIER_UPGRADE_REQUIRED, null]

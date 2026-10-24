@@ -1,0 +1,39 @@
+# AetherFlow reverse proxy. Production requires DOMAIN to resolve to this server
+# and ports 80/443 to be reachable. localhost is for development only.
+{
+    email {$ACME_EMAIL:admin@example.com}
+}
+
+{$DOMAIN:localhost} {
+    encode zstd gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+        Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'"
+        -Server
+    }
+
+    # Keep SSE unbuffered so clients receive progress as events arrive.
+    @sse path /jobs/*/progress
+    handle @sse {
+        reverse_proxy orchestrator:8000 {
+            flush_interval -1
+        }
+    }
+
+    handle {
+        reverse_proxy orchestrator:8000 {
+            health_uri /health
+            health_interval 30s
+        }
+    }
+
+    log {
+        output stdout
+        format json
+    }
+}

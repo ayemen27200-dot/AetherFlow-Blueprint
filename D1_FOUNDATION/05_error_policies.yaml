@@ -1,0 +1,23 @@
+policies:
+  NETWORK: {retries: 5, backoff: exponential, base_sec: 5, max_sec: 300, action: retry}
+  OOM: {retries: 2, backoff: linear, base_sec: 30, action: downgrade_or_reassign}
+  QUOTA_EXCEEDED: {retries: 0, action: pause_and_notify}
+  INVALID_INPUT: {retries: 0, action: fail_permanent}
+  TOOL_ERROR:
+    retries: 3
+    backoff: exponential
+    base_sec: 10
+    retry_if: "exit_code in [OOM, TIMEOUT]"
+    else: INVALID_INPUT
+  AUTH_ERROR:
+    retries: 0
+    action: disable_account_and_notify
+    on_no_accounts_left: disable_cloud_tasks_and_urgent_notify
+
+dispatch_guards:
+  CLOUD_FORBIDDEN:
+    when: "tier==local_only AND executor==modal_propainter"
+    action: reject_job_with_reason
+  TIER_UPGRADE_REQUIRED:
+    when: "tier==free AND paid_provider_required==true"
+    action: reject_job_ask_user_to_confirm

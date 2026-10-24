@@ -1,0 +1,26 @@
+{
+  "whisper_cpp": {
+    "base": {
+      "file": "ggml-base.bin",
+      "sha256": "FILL_ON_FIRST_RUN",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+      "size_mb_approx": 142
+    },
+    "small": {
+      "file": "ggml-small.bin",
+      "sha256": "FILL_ON_FIRST_RUN",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+      "size_mb_approx": 466
+    }
+  },
+  "faster_whisper": {
+    "small": {
+      "repo": "Systran/faster-whisper-small",
+      "revision": "PIN_COMMIT_BEFORE_RELEASE"
+    }
+  },
+  "propainter": {
+    "weights_sha256": "FILL_ON_FIRST_RUN",
+    "revision": "PIN_BEFORE_RELEASE"
+  }
+}

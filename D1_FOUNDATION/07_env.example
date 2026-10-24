@@ -1,0 +1,18 @@
+# Security — populate locally; never commit real secrets
+FERNET_KEY=
+BEARER_TOKEN=
+AGENTS_AUTH_TOKEN=
+
+# Database
+DATABASE_PATH=./aetherflow.db
+
+# Integrations
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+MODAL_TOKEN_ID=
+MODAL_TOKEN_SECRET=
+
+# Server
+HOST=127.0.0.1
+PORT=8000
+LOG_LEVEL=INFO

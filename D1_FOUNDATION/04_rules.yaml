@@ -1,0 +1,76 @@
+version: 1
+rules:
+  - name: transcription_arabic_phone
+    when:
+      all:
+        - {task: transcription}
+        - {language: ar}
+        - {environment_type: phone}
+        - {ram_available_gb: {gte: 4}}
+        - {battery_pct: {gte: 40}}
+        - {duration_min: {lt: 30}}
+        - {thermal_status: normal}
+    then: {executor: whisper_cpp, model: small}
+
+  - name: transcription_arabic_vps
+    when:
+      all:
+        - {task: transcription}
+        - {language: ar}
+        - {environment_type: vps}
+    then: {executor: faster_whisper, model: small}
+
+  - name: transcription_phone_fast
+    when:
+      all:
+        - {task: transcription}
+        - {environment_type: phone}
+        - {not: [{language: ar}]}
+        - {ram_available_gb: {gte: 4}}
+        - {duration_min: {lt: 30}}
+        - {battery_pct: {gte: 40}}
+        - {thermal_status: normal}
+    then: {executor: whisper_cpp, model: base}
+
+  - name: transcription_vps_fallback
+    when:
+      all:
+        - {task: transcription}
+        - {environment_type: vps}
+    then: {executor: faster_whisper, model: small}
+
+  - name: text_removal_vps_gpu
+    when:
+      all:
+        - {task: text_removal}
+        - {environment_type: vps}
+        - {gpu_vram_gb: {gte: 8}}
+    then:
+      executor: propainter
+      checkpointing: {strategy: chunked_with_overlap, chunk_sec: 300, overlap_sec: 30, blending: linear_crossfade}
+
+  - name: text_removal_cloud_fallback
+    when:
+      all:
+        - {task: text_removal}
+        - {not: [{environment_type: vps, gpu_vram_gb: {gte: 8}}]}
+        - {cloud_consent: true}
+    then: {executor: modal_propainter}
+
+  - name: split_always_local
+    when: {task: split}
+    then: {executor: ffmpeg, args: ["-c", "copy"]}
+
+  - name: default_fallback
+    when: {always: true}
+    then: {executor: error, action: queue_and_notify_admin}
+
+environment_selection:
+  strategy: ordered_fallback
+  order: [phone, vps, cloud]
+  per_job_override: true
+  constraints:
+    - "phone: استبعد إذا battery_pct < 20 أو thermal_status = hot"
+    - "vps/cloud: استبعد إذا tier = local_only"
+    - "cloud: استبعد إذا quota_used >= quota_limit"
+    - "cloud: استبعد إذا cloud_consent != true"

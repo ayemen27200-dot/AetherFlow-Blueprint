@@ -1,0 +1,29 @@
+cost_policy:
+  tier: free # free | paid_optional | local_only
+  max_monthly_cost_usd: 0
+  require_confirm_for_paid: true
+
+limits:
+  max_file_size_mb: 2000
+  max_concurrent_per_environment: 1
+  job_events_retention_days: 30
+
+retention:
+  default_hours: 24
+  on_delete_after_completion: immediate
+  delay_hours: 0
+
+agents:
+  auth_token: "" # Generate during initialization; never commit a real token.
+
+environment_selection:
+  order: [phone, vps, cloud]
+
+integrations:
+  telegram:
+    enabled: false
+    bot_token: ""
+    chat_id: ""
+  modal:
+    token_id: ""
+    token_secret: ""

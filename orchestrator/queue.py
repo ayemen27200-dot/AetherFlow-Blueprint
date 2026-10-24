@@ -577,17 +577,34 @@ class SQLiteQueue:
         except sqlite3.IntegrityError as exc:
             raise JobAlreadyExistsError(f"job already exists: {job.id}") from exc
 
-    def dequeue(self) -> QueuedJob | None:
+    def dequeue(
+        self, job_types: Sequence[str] | None = None
+    ) -> QueuedJob | None:
         """Atomically claim the highest-priority queued job.
 
         Returns ``None`` when the queue is empty. The claimed job moves to
         ``assigned``, carries a ``started_at`` timestamp and its claim
         generation (``retry_count``) is returned as ``QueuedJob.attempt``. The
         transaction commits before any external processing begins.
+
+        ``job_types`` optionally restricts the claim to the given job types
+        so a specialized worker never claims work it cannot execute. The
+        filter is bound-parameter based; the default (``None``) preserves the
+        unfiltered behaviour.
         """
+        if job_types is not None:
+            types = tuple(job_types)
+            if not types or not all(isinstance(item, str) and item for item in types):
+                raise ValueError("job_types must be a non-empty sequence of strings")
+            placeholders = ", ".join("?" for _ in types)
+            type_clause = f"AND type IN ({placeholders})"
+            params: tuple[object, ...] = (_STATUS_ASSIGNED, _STATUS_QUEUED, *types)
+        else:
+            type_clause = ""
+            params = (_STATUS_ASSIGNED, _STATUS_QUEUED)
         with self._immediate() as conn:
             row = conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET status = ?,
                     started_at = CURRENT_TIMESTAMP
@@ -595,13 +612,14 @@ class SQLiteQueue:
                     SELECT id
                     FROM jobs
                     WHERE status = ?
+                      {type_clause}
                     ORDER BY priority DESC, created_at ASC, rowid ASC
                     LIMIT 1
                 )
                 RETURNING id, type, priority, created_at, input_path,
                           cloud_consent, retry_count, checkpoint_data
                 """,
-                (_STATUS_ASSIGNED, _STATUS_QUEUED),
+                params,
             ).fetchone()
         if row is None:
             return None
@@ -751,6 +769,34 @@ class SQLiteQueue:
             _STATUS_COMPLETED,
             _CLAIMED_STATUSES,
             generation=generation,
+            completed_at=_sql_timestamp(),
+        )
+
+    def complete_job(
+        self,
+        job_id: str,
+        *,
+        generation: int,
+        output_paths: Sequence[str],
+    ) -> None:
+        """Record successful completion together with verified output paths.
+
+        The status transition, ``completed_at`` stamp and output list are
+        applied in one fenced atomic update, so a worker can never publish
+        outputs without owning the current claim generation. Every path must
+        be a non-empty string; the queue stores them verbatim as JSON and
+        never interprets them (the worker is solely responsible for the
+        containment and verification that produced them).
+        """
+        paths = tuple(output_paths)
+        if not paths or any(not isinstance(item, str) or not item for item in paths):
+            raise ValueError("output_paths must be a non-empty sequence of strings")
+        self._transition(
+            job_id,
+            _STATUS_COMPLETED,
+            _CLAIMED_STATUSES,
+            generation=generation,
+            output_paths=json.dumps(list(paths), separators=(",", ":")),
             completed_at=_sql_timestamp(),
         )
 

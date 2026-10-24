@@ -900,6 +900,52 @@ def test_recovery_rejects_invalid_generation_values(tmp_path: Path) -> None:
         assert queue.get_status("j1") == "assigned"
 
 
+def test_recovery_rejects_duplicate_job_ids_without_any_write(
+    tmp_path: Path,
+) -> None:
+    """A duplicated id is a supervisor bug: the call must fail before any
+    write, leaving the claim intact and exactly one valid recovery possible."""
+    db_path = tmp_path / "q.db"
+    with SQLiteQueue(db_path) as queue:
+        queue.enqueue(make_job("j1"))
+        claim = queue.dequeue()
+        assert claim is not None
+
+        with pytest.raises(ValueError, match="duplicate"):
+            queue.recover_claimed_jobs(
+                ["j1", "j1"],
+                generation_by_id={"j1": claim.attempt},
+                reason="buggy duplicate supervisor batch",
+            )
+        # Nothing moved: the original claim is still active.
+        assert queue.get_status("j1") == "assigned"
+        job = queue.get("j1")
+        assert job is not None and job.attempt == 0
+
+        # The same job can still be recovered exactly once via a valid call.
+        assert (
+            queue.recover_claimed_jobs(
+                ["j1"],
+                generation_by_id={"j1": claim.attempt},
+                reason="single valid recovery",
+            )
+            == 1
+        )
+
+    with raw_connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT status, retry_count FROM jobs WHERE id = 'j1'"
+        ).fetchone()
+        events = conn.execute(
+            "SELECT event_type, payload_json FROM job_events WHERE job_id = 'j1'"
+        ).fetchall()
+    assert row["status"] == "queued"
+    assert row["retry_count"] == 1
+    # Exactly one event, from the valid recovery only — no spurious duplicate.
+    assert [event["event_type"] for event in events] == ["job_requeued"]
+    assert json.loads(events[0]["payload_json"])["reason"] == "single valid recovery"
+
+
 def test_no_automatic_time_based_rescheduling_exists(tmp_path: Path) -> None:
     # Regression guard for the audit finding: the queue must expose no method
     # that requeues a job purely because started_at grew old.

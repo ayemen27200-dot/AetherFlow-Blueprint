@@ -637,6 +637,9 @@ class SQLiteQueue:
           The same applies to jobs that are no longer in a claimed state.
           This fencing is what makes a duplicated/stale recovery notification
           unable to reschedule a newer worker's claim.
+        * Duplicate job ids in ``job_ids`` are a caller bug and are rejected
+          with ``ValueError`` before any write, so one job can never be
+          recovered twice by a single call.
         * ``reason`` is a free-text **audit annotation**, recorded verbatim
           into ``job_events``; it is never parsed or verified as liveness
           evidence, and supplying a string does not by itself justify
@@ -651,15 +654,21 @@ class SQLiteQueue:
         claimable again under a new generation; jobs at/over ``max_retries``
         become ``failed``. An event is appended to ``job_events`` only for
         rows whose fenced update actually succeeded. Unknown job ids raise
-        :class:`JobNotFoundError`; a missing or invalid generation mapping
-        raises :class:`ValueError`/``TypeError`` before any write. Returns the
-        number of recovered rows.
+        :class:`JobNotFoundError`; duplicate ids, a missing or invalid
+        generation mapping raise :class:`ValueError`/``TypeError`` before any
+        write. Returns the number of recovered rows.
         """
         ids = tuple(job_ids)
         if not ids:
             raise ValueError("job_ids must not be empty")
         if not reason or not reason.strip():
             raise ValueError("an explicit, non-empty recovery reason is required")
+        duplicate_ids = sorted({job_id for job_id in ids if ids.count(job_id) > 1})
+        if duplicate_ids:
+            raise ValueError(
+                "duplicate job ids are not allowed in one recovery call: "
+                + ", ".join(duplicate_ids)
+            )
         if not isinstance(generation_by_id, Mapping):
             raise TypeError(
                 "generation_by_id must map each job id to the supervisor's "
@@ -717,12 +726,14 @@ class SQLiteQueue:
             for job_id in ids:
                 expected_generation = generation_by_id[job_id]
                 row = claimed.get(job_id)
-                if row is None or row["retry_count"] != expected_generation:
-                    # No longer claimed, or a stale supervisor generation:
-                    # leave the newer worker's state alone and stay silent.
-                    continue
 
-                conn.execute(
+                # The RETURNING clause is the success authority: it yields a
+                # row only when the fenced compare-and-swap actually changed
+                # exactly this row. A stale generation or a no-longer-claimed
+                # job matches zero rows, so no event can ever be recorded
+                # without a confirmed state change (even if a future change
+                # ever invalidated the in-transaction snapshot above).
+                updated = conn.execute(
                     """
                     UPDATE jobs
                     SET status = CASE
@@ -734,6 +745,7 @@ class SQLiteQueue:
                     WHERE id = ?
                       AND retry_count = ?
                       AND status IN (?, ?)
+                    RETURNING id
                     """,
                     (
                         max_retries,
@@ -742,12 +754,14 @@ class SQLiteQueue:
                         _STATUS_ASSIGNED,
                         _STATUS_PROCESSING,
                     ),
-                )
-                # The BEGIN IMMEDIATE write lock is held for this whole
-                # transaction and the snapshot above already matched this id,
-                # generation and claimed status, so this UPDATE always changes
-                # exactly one row; no separate rowcount branch is needed.
+                ).fetchone()
+                if updated is None:
+                    # No longer claimed, or a stale supervisor generation:
+                    # leave the newer worker's state alone and stay silent.
+                    continue
 
+                # A returned row proves the snapshot row was the one changed.
+                assert row is not None
                 will_fail = expected_generation >= max_retries
                 conn.execute(
                     """

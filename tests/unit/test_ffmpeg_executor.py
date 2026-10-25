@@ -527,3 +527,48 @@ def test_from_config_reads_project_transfer_contract(tmp_path: Path) -> None:
     assert built.allowed_extensions == frozenset(
         {".mp4", ".mkv", ".mov", ".mp3", ".wav", ".m4a"}
     )
+
+
+def test_resolve_transfer_spec_explicit_argument_wins(tmp_path: Path) -> None:
+    spec = tmp_path / "file_transfer_spec.yaml"
+    spec.write_text(
+        "constraints:\n  max_file_size_mb: 42\n  allowed_extensions: [.mp4]\n",
+        encoding="utf-8",
+    )
+    resolved = ffmpeg_mod.resolve_transfer_spec(spec)
+    assert resolved == spec.resolve()
+
+
+def test_resolve_transfer_spec_env_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = tmp_path / "nested" / "file_transfer_spec.yaml"
+    spec.parent.mkdir(parents=True)
+    spec.write_text("constraints: {max_file_size_mb: 1, allowed_extensions: []}\n")
+    monkeypatch.setenv("AETHERFLOW_TRANSFER_SPEC", str(spec))
+    assert ffmpeg_mod.resolve_transfer_spec() == spec.resolve()
+
+
+def test_resolve_transfer_spec_cwd_fallback_for_containers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Simulate the installed wheel layout: no package-relative config exists.
+    monkeypatch.setattr(ffmpeg_mod, "_PACKAGE_SPEC", tmp_path / "missing.yaml")
+    monkeypatch.delenv("AETHERFLOW_TRANSFER_SPEC", raising=False)
+    app_dir = tmp_path / "app"
+    (app_dir / "config").mkdir(parents=True)
+    spec = app_dir / "config" / "file_transfer_spec.yaml"
+    spec.write_text("constraints: {max_file_size_mb: 1, allowed_extensions: []}\n")
+    monkeypatch.chdir(app_dir)
+    assert ffmpeg_mod.resolve_transfer_spec() == spec.resolve()
+
+
+def test_resolve_transfer_spec_missing_everywhere_is_path_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ffmpeg_mod, "_PACKAGE_SPEC", tmp_path / "missing.yaml")
+    monkeypatch.delenv("AETHERFLOW_TRANSFER_SPEC", raising=False)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(FileNotFoundError) as excinfo:
+        ffmpeg_mod.resolve_transfer_spec()
+    assert str(tmp_path) not in str(excinfo.value)

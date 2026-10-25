@@ -41,7 +41,35 @@ from typing import Any
 from .base import Executor
 
 # Reuse the project's transfer contract for size/extension limits.
-_TRANSFER_SPEC = Path(__file__).resolve().parents[1] / "config" / "file_transfer_spec.yaml"
+_PACKAGE_SPEC = Path(__file__).resolve().parents[1] / "config" / "file_transfer_spec.yaml"
+# Backwards-compatible alias for existing imports/tests.
+_TRANSFER_SPEC = _PACKAGE_SPEC
+
+
+def resolve_transfer_spec(spec_path: str | Path | None = None) -> Path:
+    """Locate ``file_transfer_spec.yaml`` across deployment layouts.
+
+    Order: an explicit argument, the ``AETHERFLOW_TRANSFER_SPEC`` override,
+    the package-relative copy (editable installs and the test suite), and a
+    ``config/`` directory under the current working directory (the container
+    image installs the YAML at ``/app/config`` with WORKDIR ``/app``).
+    Fails with a path-free message so startup logs never disclose layout.
+    """
+    candidates: list[Path] = []
+    if spec_path is not None:
+        candidates.append(Path(spec_path))
+    override = os.environ.get("AETHERFLOW_TRANSFER_SPEC")
+    if override:
+        candidates.append(Path(override))
+    candidates.append(_PACKAGE_SPEC)
+    candidates.append(Path.cwd() / "config" / "file_transfer_spec.yaml")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        "file_transfer_spec.yaml not found in configured, package or working"
+        " directory locations"
+    )
 
 # Job ids double as output directory names; keep them to bounded safe tokens.
 _JOB_ID_RE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
@@ -199,7 +227,7 @@ class FFmpegSplitExecutor(Executor):
     @classmethod
     def from_config(
         cls,
-        spec_path: str | Path = _TRANSFER_SPEC,
+        spec_path: str | Path | None = None,
         *,
         allowed_base_dir: str | Path,
         output_base_dir: str | Path,
@@ -211,7 +239,8 @@ class FFmpegSplitExecutor(Executor):
         """Build an executor whose limits come from the transfer YAML only."""
         import yaml
 
-        data = yaml.safe_load(Path(spec_path).read_text(encoding="utf-8"))
+        resolved_spec = resolve_transfer_spec(spec_path)
+        data = yaml.safe_load(resolved_spec.read_text(encoding="utf-8"))
         constraints = data["constraints"]
         return cls(
             segment_sec,

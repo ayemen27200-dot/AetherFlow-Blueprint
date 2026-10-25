@@ -117,11 +117,14 @@ a JUnit artifact in CI, not estimated.
   one SQLite file and one data volume with the orchestrator, with the API
   port unpublished and containers hardened; eight structural tests plus a
   CI `compose-smoke` job (`scripts/verify_compose_stack.sh`) exist. The
-  first runner execution failed because the host-created bind mount was not
-  writable by the image's non-root uid 1000; the verifier and VPS installer
-  now set the data-tree permissions explicitly. No operational claim is
-  made until the re-run passes. TLS/Caddy certificate behaviour
-  additionally needs a real host with DNS.
+  runner executions exposed two real deployment defects, both fixed: the
+  host-created bind mount was not writable by the image's non-root uid 1000
+  (explicit data-tree permissions in the verifier and VPS installer), and a
+  wheel-installed worker could not locate `config/file_transfer_spec.yaml`
+  because the path was package-relative (`resolve_transfer_spec` now also
+  honours an env override and a working-directory fallback, with unit
+  tests). No operational claim is made until the re-run passes.
+  TLS/Caddy certificate behaviour additionally needs a real host with DNS.
 - Long-media performance has been measured honestly in the two-core build
   environment via `scripts/benchmark_long_media.sh`: the 30-minute case
   takes 34.51s wall (target <15s) and the two-hour case 135.48s (target

@@ -629,6 +629,17 @@ class SQLiteQueue:
         """Number of jobs still waiting to be claimed (status ``queued``)."""
         return self.count(_STATUS_QUEUED)
 
+    def ping(self) -> None:
+        """Probe database connectivity; raises ``sqlite3.Error`` when unavailable.
+
+        A trivial ``SELECT 1`` under the instance lock is enough to surface
+        a closed connection or an unavailable database file. Callers (the
+        health endpoint) map any failure to a generic status without
+        exposing driver text or filesystem paths.
+        """
+        with self._lock:
+            self._conn.execute("SELECT 1").fetchone()
+
     def count(self, status: str | None = None) -> int:
         """Count jobs, optionally restricted to one status."""
         with self._lock:

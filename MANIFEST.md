@@ -8,7 +8,7 @@
 |---|---:|---|
 | D0 Master Blueprint | 2 | Project constitution and architecture |
 | D1 Foundation | 12 | Plantree, SQLite schema, OpenAPI 3.1, policy/config examples, checkpoint/model lock, runbook, license and delivery notes |
-| D2 MVP | 8 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria, delivery note, living G2 evidence ledger and the archived Task016 acceptance report |
+| D2 MVP | 9 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria, delivery note, living G2 evidence ledger and the Task016/Task017 acceptance reports |
 | D3 Core Engine | 7 | ASR, agent protocol, SSE, web UI, Tailscale, acceptance criteria and delivery note |
 | D4 Cloud Scale | 7 | ProPainter/mask policy, Modal, quota management, LiteLLM, Telegram, acceptance criteria and delivery note |
 | D5 Hardening | 7 | Test, security, accessibility, backup, CI/CD, release and delivery plans |
@@ -18,7 +18,7 @@
 | Docker deployment | 4 | Dockerfile, Caddy reverse proxy, Compose stack (with a real worker service) and `.dockerignore` |
 | Scripts | 9 | Phone/VPS installers, setup wizard, spec validator, JUnit summary, fixture generator, clean-host Compose verifier and reproducible long-media benchmark (+ package initializer) |
 | Tests and fixture | 13 | Unit/API/integration suites, structural Compose configuration tests, media-toolchain guard, fixture instructions and the synthetic 5-second MP4 |
-| **Total payload (excluding caches/VCS metadata)** | **123** | Files only; directory entries are not included |
+| **Total payload (excluding caches/VCS metadata)** | **124** | Files only; directory entries are not included |
 
 The 41 Dossier files are the formal specification set (D0–D5 documents). The remaining files provide project metadata, implemented D2 components or starter/scaffold assets for later milestones.
 
@@ -115,16 +115,18 @@ a JUnit artifact in CI, not estimated.
 
 - The Compose stack now runs a real `aetherflow worker run` service sharing
   one SQLite file and one data volume with the orchestrator, with the API
-  port unpublished and containers hardened; eight structural tests plus a
-  CI `compose-smoke` job (`scripts/verify_compose_stack.sh`) exist. The
-  runner executions exposed two real deployment defects, both fixed: the
-  host-created bind mount was not writable by the image's non-root uid 1000
-  (explicit data-tree permissions in the verifier and VPS installer), and a
-  wheel-installed worker could not locate `config/file_transfer_spec.yaml`
-  because the path was package-relative (`resolve_transfer_spec` now also
-  honours an env override and a working-directory fallback, with unit
-  tests). No operational claim is made until the re-run passes.
-  TLS/Caddy certificate behaviour additionally needs a real host with DNS.
+  port unpublished and containers hardened. The CI `compose-smoke` job
+  (`scripts/verify_compose_stack.sh`, ten sections, no continue-on-error)
+  passes end-to-end on a clean ubuntu-latest runner (run 40150132081):
+  image build, live DB health, queued→completed over real HTTP, independent
+  output decode inside the worker container, corrupt-input failure without
+  partial output, worker restart durability, leak scans and confirmation
+  that port 8000 is never host-published. Five earlier failed runs exposed
+  and fixed real defects (bind-mount permissions for uid 1000; a
+  package-relative transfer-spec path in wheel installs, now resolved by
+  `resolve_transfer_spec` with unit tests; two verifier-script bugs). A
+  public Let's Encrypt certificate still needs a real DNS host; only the
+  internal localhost certificate has been observed on the runner.
 - Long-media performance has been measured honestly in the two-core build
   environment via `scripts/benchmark_long_media.sh`: the 30-minute case
   takes 34.51s wall (target <15s) and the two-hour case 135.48s (target

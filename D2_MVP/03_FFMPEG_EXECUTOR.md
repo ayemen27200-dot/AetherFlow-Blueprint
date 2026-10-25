@@ -48,4 +48,4 @@ ffmpeg -hide_banner -nostdin -i input.mp4 \
 `scripts/benchmark_long_media.sh` الذي يبني عيّنتي 30 دقيقة وساعتين بلا إعادة ترميز،
 ويسجّل زمن النسخ وحده وزمن المسار الكامل ومواصفات الجهاز في `data/bench/RESULTS.md`.
 نتائج أي بيئة غير VPS المستهدف تبين بيئتها صراحةً ولا تعتبر إثباتاً للهدف؛ انظر
-`D2_MVP/06_G2_EVIDENCE_LEDGER.md` لآخر القياسات وحالة كل هدف.
+`D2_MVP/07_G2_EVIDENCE_LEDGER.md` لآخر القياسات وحالة كل هدف.

@@ -8,17 +8,17 @@
 |---|---:|---|
 | D0 Master Blueprint | 2 | Project constitution and architecture |
 | D1 Foundation | 12 | Plantree, SQLite schema, OpenAPI 3.1, policy/config examples, checkpoint/model lock, runbook, license and delivery notes |
-| D2 MVP | 6 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria and delivery note |
+| D2 MVP | 8 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria, delivery note, living G2 evidence ledger and the archived Task016 acceptance report |
 | D3 Core Engine | 7 | ASR, agent protocol, SSE, web UI, Tailscale, acceptance criteria and delivery note |
 | D4 Cloud Scale | 7 | ProPainter/mask policy, Modal, quota management, LiteLLM, Telegram, acceptance criteria and delivery note |
 | D5 Hardening | 7 | Test, security, accessibility, backup, CI/CD, release and delivery plans |
 | Root metadata and packaging | 9 | README, `README_D2.md`, pyproject, `.env.example`, `.gitignore`, changelog, contributing guide, MIT license and manifest |
 | Python packages | 21 | `agent/`, `orchestrator/`, `executors/` and `web/`; D2 queue/API/worker/FFmpeg paths are implemented, later-milestone executors remain scaffolds |
 | Runtime configuration | 5 | Example config, transfer spec, error policies, rules and model-lock copy |
-| Docker deployment | 3 | Dockerfile, Caddy reverse proxy and Compose scaffold |
-| Scripts | 7 | Phone/VPS installers, setup wizard, spec validator, JUnit summary and fixture generator (+ package initializer) |
-| Tests and fixture | 12 | Unit/API/integration suites, media-toolchain guard, fixture instructions and the synthetic 5-second MP4 |
-| **Total payload (excluding caches/VCS metadata)** | **117** | Files only; directory entries are not included |
+| Docker deployment | 4 | Dockerfile, Caddy reverse proxy, Compose stack (with a real worker service) and `.dockerignore` |
+| Scripts | 9 | Phone/VPS installers, setup wizard, spec validator, JUnit summary, fixture generator, clean-host Compose verifier and reproducible long-media benchmark (+ package initializer) |
+| Tests and fixture | 13 | Unit/API/integration suites, structural Compose configuration tests, media-toolchain guard, fixture instructions and the synthetic 5-second MP4 |
+| **Total payload (excluding caches/VCS metadata)** | **123** | Files only; directory entries are not included |
 
 The 41 Dossier files are the formal specification set (D0–D5 documents). The remaining files provide project metadata, implemented D2 components or starter/scaffold assets for later milestones.
 
@@ -43,7 +43,7 @@ python scripts/validate_specs.py
 python -m compileall -q agent orchestrator executors web scripts
 ruff check .
 pytest -q
-bash -n scripts/install_phone.sh scripts/install_vps.sh scripts/generate_test_fixture.sh
+bash -n scripts/install_phone.sh scripts/install_vps.sh scripts/generate_test_fixture.sh scripts/verify_compose_stack.sh scripts/benchmark_long_media.sh
 ```
 
 For the full media pipeline (mirrors CI), install FFmpeg and FFprobe and
@@ -113,11 +113,20 @@ a JUnit artifact in CI, not estimated.
 
 ### Implemented but not yet operationally proven
 
-- Docker/Compose/Caddy clean-install, file-permission and TLS behaviour are
-  scaffolded but have not been verified on a clean host (Docker is not
-  available in the build environment).
-- The 30-minute media split and its performance targets are not measured;
-  they require the target VPS and a large fixture.
+- The Compose stack now runs a real `aetherflow worker run` service sharing
+  one SQLite file and one data volume with the orchestrator, with the API
+  port unpublished and containers hardened; eight structural tests plus a
+  CI `compose-smoke` job (`scripts/verify_compose_stack.sh`) exist, but the
+  clean-host build/run has not yet executed on a runner, so no operational
+  claim is made until that job passes. TLS/Caddy certificate behaviour
+  additionally needs a real host with DNS.
+- Long-media performance has been measured honestly in the two-core build
+  environment via `scripts/benchmark_long_media.sh`: the 30-minute case
+  takes 34.51s wall (target <15s) and the two-hour case 135.48s (target
+  <60s); pure stream-copy split alone is 0.90s/4.04s, so the mandatory
+  decode verification dominates. Neither target is met here, and the VPS
+  run that can close the criteria remains pending. Full matrix:
+  `D2_MVP/07_G2_EVIDENCE_LEDGER.md`.
 - A full secret-leak audit of every component has not been performed;
   automated coverage currently targets the worker failure path.
 

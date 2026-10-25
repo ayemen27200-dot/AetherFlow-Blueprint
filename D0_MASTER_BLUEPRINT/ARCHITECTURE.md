@@ -226,7 +226,8 @@ stateDiagram-v2
 | Web UI LCP | متصفح مدعوم | أقل من 2.5s |
 | SSE latency | شبكة مستقرة | أقل من 500ms مستهدف |
 | Heartbeat latency | شبكة مستقرة | أقل من 200ms مستهدف |
-| Split لفيديو ساعتين (`-c copy`) | VPS | أقل من 60s مستهدف؛ يعتمد على I/O وkeyframes |
+| Split لفيديو 30 دقيقة (المسار الكامل مع فحص الفك) | VPS | أقل من 15s مستهدف؛ يُقاس بـ`scripts/benchmark_long_media.sh` |
+| Split لفيديو ساعتين (`-c copy`، المسار الكامل مع فحص الفك) | VPS | أقل من 60s مستهدف؛ يعتمد على I/O وkeyframes ويُقاس بنفس السكربت |
 | Transcription 30 دقيقة (`small`) | GPU/VPS | يقاس benchmark فعلي؛ لا تعتمد أرقاماً غير معاد إنتاجها |
 | ProPainter لفيديو 10 دقائق | Modal GPU | يقاس حسب الدقة والإعدادات والعتاد |
 

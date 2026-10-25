@@ -139,6 +139,9 @@ api_call() {
 job_id() { python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
 job_status() { python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])'; }
 wait_terminal() {
+  # Echoes the bare terminal status word ("completed"/"failed"); the full
+  # last JSON representation is kept in /tmp/last-status for callers that
+  # need the whole record.
   local id="$1"
   for _ in $(seq 1 60); do
     local state
@@ -146,7 +149,8 @@ wait_terminal() {
     local status
     status="$(printf '%s' "$state" | job_status)"
     if [[ "$status" == "completed" || "$status" == "failed" ]]; then
-      printf '%s' "$state" | tee /tmp/last-status
+      printf '%s' "$state" > /tmp/last-status
+      printf '%s' "$status"
       return 0
     fi
     sleep 1

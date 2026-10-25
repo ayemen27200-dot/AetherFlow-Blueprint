@@ -12,7 +12,11 @@ services:
     image: aetherflow-local:latest
     restart: unless-stopped
     env_file:
-      - ../.env
+      # Optional: the stack also runs with environment variables supplied
+      # directly; the isolated smoke verifier injects its own temp env file
+      # via an override, so a missing .env must not be a hard error.
+      - path: ../.env
+        required: false
     environment:
       HOST: 0.0.0.0
       PORT: "8000"
@@ -40,7 +44,11 @@ services:
     image: aetherflow-local:latest
     restart: unless-stopped
     env_file:
-      - ../.env
+      # Optional: the stack also runs with environment variables supplied
+      # directly; the isolated smoke verifier injects its own temp env file
+      # via an override, so a missing .env must not be a hard error.
+      - path: ../.env
+        required: false
     environment:
       # Same physical file as the orchestrator's DATABASE_PATH (WAL allows the
       # multi-process access; busy_timeout serializes write contention).

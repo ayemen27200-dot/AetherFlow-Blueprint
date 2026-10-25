@@ -106,3 +106,16 @@ def test_env_example_documents_matching_local_paths() -> None:
     # Host-relative equivalents of the container paths used in Compose.
     assert "AETHERFLOW_UPLOAD_STORE=./data/upload_store" in env
     assert "AETHERFLOW_OUTPUT_DIR=./data/outputs" in env
+
+
+def test_env_file_is_optional_for_both_application_services(compose: dict) -> None:
+    # The isolated verifier injects its own temporary env file via an
+    # override; the base ../.env must therefore be optional so a clean
+    # checkout (no .env) still validates and starts.
+    for name in ("orchestrator", "worker"):
+        entries = _service(compose, name).get("env_file", [])
+        assert entries, f"{name} must declare its env_file policy"
+        assert any(
+            isinstance(entry, dict) and entry.get("required") is False
+            for entry in entries
+        ), f"{name} env_file must use required: false"

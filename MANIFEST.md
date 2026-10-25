@@ -125,9 +125,10 @@ a JUnit artifact in CI, not estimated.
   independent audit then found the verifier could delete repository data and
   tear down a fixed-name project, and that the VPS installer had a 0777
   fallback; all three were remediated (fully isolated mktemp working
-  directory, unique per-run Compose project/image, 0600 env file,
-  container-based chown with no world-writable path, an explicit
-  non-interference section, and eight regression tests in
+  directory, unique per-run Compose project/image/named volume (compatible
+  with user-namespace Docker), 0600 env file, non-root uid-1000 seeding at
+  0750/0640 with no world-writable path, an explicit non-interference
+  section, and nine regression tests in
   `tests/unit/test_verifier_isolation.py`). The isolated eleven-section
   script is re-proven on the runner by the `compose-smoke` job on the final
   head; no operational claim is made until that run is green. A public

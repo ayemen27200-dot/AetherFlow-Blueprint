@@ -188,16 +188,15 @@ PY
 section "3. build and start the isolated stack"
 "${COMPOSE[@]}" build > "$BUILD_LOG" 2>&1
 echo "image build OK (full log: $BUILD_LOG)"
-# Seed the named volume from inside the container namespace: the one-shot
-# root container creates the data layout, copies the read-only seed objects
-# and hands everything to the non-root uid 1000 with 0750/0640 modes. This is
-# what makes the run identical on rootful and userns-remapped Docker daemons.
-"${COMPOSE[@]}" run --rm --no-deps --user root \
+# Seed the named volume as the image's own non-root uid 1000 (a fresh named
+# volume inherits /app/data ownership from the image). No root, no chown and
+# no host-side permission tricks, so the flow is identical on rootful and
+# userns-remapped daemons and keeps the service's cap_drop: ALL posture.
+"${COMPOSE[@]}" run --rm --no-deps \
   -v "$SEED_DIR:/seed:ro" orchestrator bash -c '
     set -euo pipefail
     mkdir -p /app/data/upload_store /app/data/outputs
     cp /seed/up-sample-5s.mp4 /seed/up-corrupt.mp4 /app/data/upload_store/
-    chown -R 1000:1000 /app/data
     chmod 750 /app/data /app/data/upload_store /app/data/outputs
     chmod 640 /app/data/upload_store/*
   '

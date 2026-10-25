@@ -97,10 +97,11 @@ def test_verifier_uses_a_unique_named_volume_not_a_repo_bind_mount(
     assert "$DATA_DIR:/app/data" not in verifier_text
     assert 'cat > "$REPO_ROOT/.env"' not in verifier_text
     assert '> "$REPO_ROOT/.env"' not in verifier_text
-    # The volume is seeded inside the container namespace and handed to uid
-    # 1000 with safe modes, never world-writable.
-    assert "chown -R 1000:1000 /app/data" in verifier_text
+    # The volume is seeded as the image's own uid 1000 with safe modes,
+    # never world-writable and without a root one-shot or host chown.
     assert "chmod 750 /app/data" in verifier_text
+    assert "chown -R 1000:1000 /app/data" not in verifier_text
+    assert "--user root" not in verifier_text
 
 
 def test_partial_output_check_runs_inside_the_container(verifier_text: str) -> None:

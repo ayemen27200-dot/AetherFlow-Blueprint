@@ -121,7 +121,7 @@ a JUnit artifact in CI, not estimated.
   image build, live DB health, queued→completed over real HTTP, independent
   output decode inside the worker container, corrupt-input failure without
   partial output, worker restart durability, leak scans and confirmation
-  that port 8000 is never host-published. Five earlier failed runs exposed
+  that port 8000 is never host-published. Six earlier failed runs exposed
   and fixed real defects (bind-mount permissions for uid 1000; a
   package-relative transfer-spec path in wheel installs, now resolved by
   `resolve_transfer_spec` with unit tests; two verifier-script bugs). A

@@ -8,7 +8,7 @@
 |---|---:|---|
 | D0 Master Blueprint | 2 | Project constitution and architecture |
 | D1 Foundation | 12 | Plantree, SQLite schema, OpenAPI 3.1, policy/config examples, checkpoint/model lock, runbook, license and delivery notes |
-| D2 MVP | 10 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria, delivery note, living G2 evidence ledger and the Task016/Task017/Task018 acceptance and audit reports |
+| D2 MVP | 11 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria, delivery note, living G2 evidence ledger and the Task016–Task019 acceptance, audit and criterion-review reports |
 | D3 Core Engine | 7 | ASR, agent protocol, SSE, web UI, Tailscale, acceptance criteria and delivery note |
 | D4 Cloud Scale | 7 | ProPainter/mask policy, Modal, quota management, LiteLLM, Telegram, acceptance criteria and delivery note |
 | D5 Hardening | 7 | Test, security, accessibility, backup, CI/CD, release and delivery plans |
@@ -18,7 +18,7 @@
 | Docker deployment | 4 | Dockerfile, Caddy reverse proxy, Compose stack (with a real worker service) and `.dockerignore` |
 | Scripts | 9 | Phone/VPS installers, setup wizard, spec validator, JUnit summary, fixture generator, clean-host Compose verifier and reproducible long-media benchmark (+ package initializer) |
 | Tests and fixture | 14 | Unit/API/integration suites, structural Compose configuration tests, verifier-isolation regression tests, media-toolchain guard, fixture instructions and the synthetic 5-second MP4 |
-| **Total payload (excluding caches/VCS metadata)** | **126** | Files only; directory entries are not included |
+| **Total payload (excluding caches/VCS metadata)** | **127** | Files only; directory entries are not included |
 
 The 41 Dossier files are the formal specification set (D0–D5 documents). The remaining files provide project metadata, implemented D2 components or starter/scaffold assets for later milestones.
 

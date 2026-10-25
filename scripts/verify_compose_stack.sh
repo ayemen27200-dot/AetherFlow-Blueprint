@@ -186,7 +186,19 @@ grep -q '"error_type": *"INVALID_INPUT"' /tmp/corrupt-job.json || fail "expected
 
 section "8. worker restart durability"
 "${COMPOSE[@]}" restart worker >/dev/null
-JOB3="$(api_call POST /jobs '{"type":"split","file":"up-sample-5s.mp4","priority":9"}' | job_id)"
+# Let the restarted worker settle before submitting the durability job.
+for _ in $(seq 1 30); do
+  if "${COMPOSE[@]}" ps worker | grep -q "healthy"; then break; fi
+  sleep 1
+done
+"${COMPOSE[@]}" ps worker
+CREATE3="$(api_call POST /jobs '{"type":"split","file":"up-sample-5s.mp4","priority":9}')"
+echo "$CREATE3"
+echo "$CREATE3" | grep -q '"status": *"queued"' || {
+  printf 'unexpected create response after restart: %s\n' "$CREATE3" >&2
+  fail "post-restart job was not queued"
+}
+JOB3="$(printf '%s' "$CREATE3" | job_id)"
 [[ "$(wait_terminal "$JOB3")" == "completed" ]] || fail "job after worker restart did not complete"
 
 section "9. secret and path leak scans across logs and responses"

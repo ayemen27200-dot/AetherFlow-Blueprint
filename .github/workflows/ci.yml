@@ -113,13 +113,12 @@ jobs:
             echo "### compose-smoke failure diagnostics (run ${{ github.run_id }})"
             echo '<details><summary>verifier output (tail)</summary>'
             echo '```text'
-            tail -c 50000 compose-run.log || true
+            tail -c 20000 compose-run.log || true
             echo '```'
             echo '</details>'
-            echo '<details><summary>compose ps and container logs</summary>'
+            echo '<details><summary>container state and logs captured before teardown</summary>'
             echo '```text'
-            docker compose -f docker/docker-compose.yml ps -a || true
-            docker compose -f docker/docker-compose.yml logs --tail=80 --no-color || true
+            cat /tmp/aetherflow-compose-diag.log || echo "no diagnostic file was produced"
             echo '```'
             echo '</details>'
           } > comment-body.md

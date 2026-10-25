@@ -24,8 +24,31 @@ DATA_DIR="$REPO_ROOT/data"
 TOKEN="compose-smoke-token-$(date +%s)"
 CREATED_ENV=0
 
+DIAG_LOG=/tmp/aetherflow-compose-diag.log
+: > "$DIAG_LOG"
+
 section() { printf '\n=== [%s] %s ===\n' "$(date -u +%H:%M:%SZ)" "$1"; }
-fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
+
+dump_diagnostics() {
+  # Persist container state and logs BEFORE teardown removes the stack; the
+  # CI failure step reads this file from the shared runner filesystem.
+  {
+    printf '\n--- docker compose ps -a ---\n'
+    "${COMPOSE[@]}" ps -a || true
+    printf '\n--- worker logs (tail 120) ---\n'
+    "${COMPOSE[@]}" logs --tail=120 --no-color worker || true
+    printf '\n--- orchestrator logs (tail 80) ---\n'
+    "${COMPOSE[@]}" logs --tail=80 --no-color orchestrator || true
+    printf '\n--- caddy logs (tail 40) ---\n'
+    "${COMPOSE[@]}" logs --tail=40 --no-color caddy || true
+  } 2>&1 | tee -a "$DIAG_LOG" >&2
+}
+
+fail() {
+  printf 'FAIL: %s\n' "$1" >&2
+  dump_diagnostics
+  exit 1
+}
 
 cleanup() {
   section "teardown"
@@ -36,8 +59,7 @@ cleanup() {
 on_error() {
   local code=$?
   printf '\nFAIL diagnostics (exit code %s)\n' "$code" >&2
-  "${COMPOSE[@]}" ps -a || true
-  "${COMPOSE[@]}" logs --tail=120 --no-color || true
+  dump_diagnostics
   exit "$code"
 }
 trap on_error ERR
@@ -86,7 +108,10 @@ Path("data/upload_store/up-corrupt.mp4").write_bytes(data)
 PY
 
 section "3. build and start the published stack"
-"${COMPOSE[@]}" build
+# Keep the verbose build log out of the main transcript so failure tails
+# stay readable; the CI job still fails if the build itself fails.
+"${COMPOSE[@]}" build >/tmp/aetherflow-compose-build.log 2>&1
+echo "image build OK (full log: /tmp/aetherflow-compose-build.log)"
 "${COMPOSE[@]}" up -d
 
 section "4. wait for API health (inside the compose network)"

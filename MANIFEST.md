@@ -130,8 +130,8 @@ a JUnit artifact in CI, not estimated.
   0750/0640 with no world-writable path, an explicit non-interference
   section, and nine regression tests in
   `tests/unit/test_verifier_isolation.py`). The isolated eleven-section
-  script is re-proven on the runner by the `compose-smoke` job on the final
-  head; no operational claim is made until that run is green. A public
+  script passes end-to-end on the runner's user-namespace Docker daemon
+  (run 40154243602 on head `818cd7a`). A public
   Let's Encrypt certificate still needs a real DNS host; only the internal
   localhost certificate has been observed on the runner.
 - Long-media performance has been measured honestly in the two-core build

@@ -32,6 +32,15 @@ cleanup() {
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   if [[ "$CREATED_ENV" -eq 1 ]]; then rm -f "$REPO_ROOT/.env"; fi
 }
+
+on_error() {
+  local code=$?
+  printf '\nFAIL diagnostics (exit code %s)\n' "$code" >&2
+  "${COMPOSE[@]}" ps -a || true
+  "${COMPOSE[@]}" logs --tail=120 --no-color || true
+  exit "$code"
+}
+trap on_error ERR
 trap cleanup EXIT
 
 command -v docker >/dev/null 2>&1 || fail "docker is required to run this verification"
@@ -61,6 +70,11 @@ if grep -Eq 'published:.*8000' /tmp/aetherflow-compose-config.yml; then
 fi
 echo "config valid; no host publication of port 8000"
 mkdir -p "$DATA_DIR/upload_store" "$DATA_DIR/outputs"
+# The containers run as the non-root uid 1000 baked into the image, while a
+# clean host creates this directory as the invoking user. Make the shared
+# data tree writable by the container uid; production hosts should prefer
+# `chown -R 1000:1000 data` with normal 0755 modes instead of 0777.
+chmod 0777 "$DATA_DIR" "$DATA_DIR/upload_store" "$DATA_DIR/outputs"
 cp tests/fixtures/sample_5s.mp4 "$DATA_DIR/upload_store/up-sample-5s.mp4"
 python3 - <<'PY'
 from pathlib import Path

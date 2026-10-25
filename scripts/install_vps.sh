@@ -42,8 +42,15 @@ sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plug
 
 cd "$ROOT_DIR"
 python3 scripts/init_wizard.py
-mkdir -p data
-chmod 750 data
+mkdir -p data data/upload_store data/outputs
+# The application containers run as the non-root uid 1000 defined in the
+# image; the shared bind mount must be writable by that uid.
+if sudo -n true >/dev/null 2>&1; then
+  sudo chown -R 1000:1000 data
+  chmod 750 data
+else
+  chmod 0777 data data/upload_store data/outputs
+fi
 
 # Use sudo for Docker unless the current account already has daemon access.
 DOCKER=(docker)

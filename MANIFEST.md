@@ -116,9 +116,11 @@ a JUnit artifact in CI, not estimated.
 - The Compose stack now runs a real `aetherflow worker run` service sharing
   one SQLite file and one data volume with the orchestrator, with the API
   port unpublished and containers hardened; eight structural tests plus a
-  CI `compose-smoke` job (`scripts/verify_compose_stack.sh`) exist, but the
-  clean-host build/run has not yet executed on a runner, so no operational
-  claim is made until that job passes. TLS/Caddy certificate behaviour
+  CI `compose-smoke` job (`scripts/verify_compose_stack.sh`) exist. The
+  first runner execution failed because the host-created bind mount was not
+  writable by the image's non-root uid 1000; the verifier and VPS installer
+  now set the data-tree permissions explicitly. No operational claim is
+  made until the re-run passes. TLS/Caddy certificate behaviour
   additionally needs a real host with DNS.
 - Long-media performance has been measured honestly in the two-core build
   environment via `scripts/benchmark_long_media.sh`: the 30-minute case

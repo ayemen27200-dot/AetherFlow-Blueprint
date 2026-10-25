@@ -92,21 +92,34 @@ a JUnit artifact in CI, not estimated.
   pool-wide shared job budget, a tested concurrency cap, stable path-free
   error codes, relative output references, graceful signal handling, and
   separate trusted-local (`aetherflow split`) and durable-queue
-  (`aetherflow worker run`) execution channels.
+  (`aetherflow worker run`) execution channels. An automated test asserts
+  failure logs never contain filesystem paths even when the underlying
+  exception message does.
+- **Active health endpoint** (`orchestrator/main.py`): `/health` performs a
+  live database probe and returns 200 `healthy` or a generic 503 with no
+  driver text, SQL or paths; the worker component honestly reports
+  `not_monitored` until the D3 heartbeat exists.
 - **CI**: installs real FFmpeg/FFprobe, hard-fails via the media toolchain
   guard, runs Ruff and the full suite with zero unexplained skips on the
   runner, and publishes JUnit results plus a job-summary count.
+- **Operational evidence beyond in-process tests**: a two-process run
+  (standalone Uvicorn API plus a separate `aetherflow worker run` process
+  sharing one SQLite file, driven by real HTTP calls) demonstrated
+  authentication rejection, safe-id validation, queued → completed with
+  independently decodable relative-reference outputs, corrupt-input
+  failure with no partial output, cross-process durability and status
+  filtering. The transcript is referenced from PR #6; it is a local
+  sandbox run, not a clean-host deployment.
 
 ### Implemented but not yet operationally proven
 
-- `/health` still returns the static `degraded` state; active DB/worker
-  health checks are not implemented.
 - Docker/Compose/Caddy clean-install, file-permission and TLS behaviour are
-  scaffolded but have not been verified on a clean host.
+  scaffolded but have not been verified on a clean host (Docker is not
+  available in the build environment).
 - The 30-minute media split and its performance targets are not measured;
   they require the target VPS and a large fixture.
-- Logging is structured and path-free in the new worker, but a full
-  secret-leak audit of every component has not been performed.
+- A full secret-leak audit of every component has not been performed;
+  automated coverage currently targets the worker failure path.
 
 ### Not implemented (later milestones)
 

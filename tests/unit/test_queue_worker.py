@@ -8,6 +8,7 @@ deterministically.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -258,6 +259,32 @@ def test_worker_without_output_base_fails_closed(layout) -> None:
     assert record is not None
     assert record.status == "failed"
     assert record.error_type == INTERNAL_ERROR_CODE
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ExecutorInputError("bad media at /srv/store/up-clip.mp4"),
+        RuntimeError("crash while opening /private/data/secret.mp4"),
+    ],
+)
+def test_failure_logs_never_contain_filesystem_paths(
+    layout, caplog: pytest.LogCaptureFixture, failure: Exception
+) -> None:
+    _, queue, store, *_ = layout
+    enqueue_upload(queue, "job-leak")
+    worker = QueueWorker(
+        queue, FakeExecutor(fail=failure), store, output_base_dir=layout[5]
+    )
+    with caplog.at_level(logging.DEBUG, logger="aetherflow.worker"):
+        assert worker.process_one() is True
+
+    # The stable code may appear; exception text and local paths may not.
+    assert "srv/store" not in caplog.text
+    assert "private/data" not in caplog.text
+    assert "secret.mp4" not in caplog.text
+    record = queue.fetch_job("job-leak")
+    assert record is not None and record.status == "failed"
 
 
 def test_stale_claim_is_skipped_without_failure_record(layout, monkeypatch) -> None:

@@ -43,16 +43,43 @@ class _FailingQueue:
     def list_jobs(self, *, status: str | None = None, limit: int = 50):  # pragma: no cover
         raise sqlite3.OperationalError("simulated disk failure")
 
+    def ping(self) -> None:  # pragma: no cover - exercised by the health test
+        raise sqlite3.OperationalError("simulated disk failure")
+
 
 # --------------------------------------------------------------------------- #
 # Health and authentication
 # --------------------------------------------------------------------------- #
 
 
-def test_health_is_open_and_reports_degraded(client: TestClient) -> None:
+def test_health_is_open_and_reports_live_database(client: TestClient) -> None:
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "degraded"
+    body = response.json()
+    assert body["status"] == "healthy"
+    assert body["components"]["database"] == "ok"
+    # Worker liveness must not be claimed before the D3 heartbeat exists.
+    assert body["components"]["worker"] == "not_monitored"
+
+
+def test_health_returns_503_without_leaking_database_details(
+    client: TestClient,
+) -> None:
+    # Simulated outage via a failing stand-in (not a real engine failure E2E).
+    original = client.app.state.queue
+    client.app.state.queue = _FailingQueue()
+    try:
+        response = client.get("/health")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "unhealthy"
+        assert body["components"]["database"] == "error"
+        # Generic body only: no driver text, SQL fragment or filesystem path.
+        assert "simulated" not in response.text
+        assert "sqlite" not in response.text.lower()
+        assert "/" not in response.text
+    finally:
+        client.app.state.queue = original
 
 
 def test_jobs_endpoints_require_bearer_token(client: TestClient) -> None:

@@ -86,13 +86,44 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # Scoped to this job: on failure only, post the verifier output as a PR
+      # comment so reviewers can read diagnostics without Azure-backed log
+      # downloads. This never changes repository content.
+      pull-requests: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       # The published image already bundles FFmpeg/FFprobe; no apt step needed.
       - name: Run clean-host stack verification
-        run: bash scripts/verify_compose_stack.sh
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/verify_compose_stack.sh 2>&1 | tee compose-run.log
+
+      - name: Publish failure diagnostics to the pull request
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          [[ -n "$PR_NUMBER" ]] || exit 0
+          {
+            echo "### compose-smoke failure diagnostics (run ${{ github.run_id }})"
+            echo '<details><summary>verifier output (tail)</summary>'
+            echo '```text'
+            tail -c 50000 compose-run.log || true
+            echo '```'
+            echo '</details>'
+            echo '<details><summary>compose ps and container logs</summary>'
+            echo '```text'
+            docker compose -f docker/docker-compose.yml ps -a || true
+            docker compose -f docker/docker-compose.yml logs --tail=80 --no-color || true
+            echo '```'
+            echo '</details>'
+          } > comment-body.md
+          gh pr comment "$PR_NUMBER" --body-file comment-body.md
 
       - name: Collect stack logs on failure
         if: failure()

@@ -24,7 +24,7 @@ DATA_DIR="$REPO_ROOT/data"
 TOKEN="compose-smoke-token-$(date +%s)"
 CREATED_ENV=0
 
-section() { printf '\n=== %s ===\n' "$1"; }
+section() { printf '\n=== [%s] %s ===\n' "$(date -u +%H:%M:%SZ)" "$1"; }
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 cleanup() {

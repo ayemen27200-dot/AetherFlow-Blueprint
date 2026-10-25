@@ -8,7 +8,7 @@
 |---|---:|---|
 | D0 Master Blueprint | 2 | Project constitution and architecture |
 | D1 Foundation | 12 | Plantree, SQLite schema, OpenAPI 3.1, policy/config examples, checkpoint/model lock, runbook, license and delivery notes |
-| D2 MVP | 9 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria, delivery note, living G2 evidence ledger and the Task016/Task017 acceptance reports |
+| D2 MVP | 10 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria, delivery note, living G2 evidence ledger and the Task016/Task017/Task018 acceptance and audit reports |
 | D3 Core Engine | 7 | ASR, agent protocol, SSE, web UI, Tailscale, acceptance criteria and delivery note |
 | D4 Cloud Scale | 7 | ProPainter/mask policy, Modal, quota management, LiteLLM, Telegram, acceptance criteria and delivery note |
 | D5 Hardening | 7 | Test, security, accessibility, backup, CI/CD, release and delivery plans |
@@ -17,8 +17,8 @@
 | Runtime configuration | 5 | Example config, transfer spec, error policies, rules and model-lock copy |
 | Docker deployment | 4 | Dockerfile, Caddy reverse proxy, Compose stack (with a real worker service) and `.dockerignore` |
 | Scripts | 9 | Phone/VPS installers, setup wizard, spec validator, JUnit summary, fixture generator, clean-host Compose verifier and reproducible long-media benchmark (+ package initializer) |
-| Tests and fixture | 13 | Unit/API/integration suites, structural Compose configuration tests, media-toolchain guard, fixture instructions and the synthetic 5-second MP4 |
-| **Total payload (excluding caches/VCS metadata)** | **124** | Files only; directory entries are not included |
+| Tests and fixture | 14 | Unit/API/integration suites, structural Compose configuration tests, verifier-isolation regression tests, media-toolchain guard, fixture instructions and the synthetic 5-second MP4 |
+| **Total payload (excluding caches/VCS metadata)** | **126** | Files only; directory entries are not included |
 
 The 41 Dossier files are the formal specification set (D0–D5 documents). The remaining files provide project metadata, implemented D2 components or starter/scaffold assets for later milestones.
 
@@ -116,26 +116,36 @@ a JUnit artifact in CI, not estimated.
 - The Compose stack now runs a real `aetherflow worker run` service sharing
   one SQLite file and one data volume with the orchestrator, with the API
   port unpublished and containers hardened. The CI `compose-smoke` job
-  (`scripts/verify_compose_stack.sh`, ten sections, no continue-on-error)
-  passes end-to-end on a clean ubuntu-latest runner (run 40150132081):
-  image build, live DB health, queued→completed over real HTTP, independent
-  output decode inside the worker container, corrupt-input failure without
-  partial output, worker restart durability, leak scans and confirmation
-  that port 8000 is never host-published. Six earlier failed runs exposed
-  and fixed real defects (bind-mount permissions for uid 1000; a
-  package-relative transfer-spec path in wheel installs, now resolved by
-  `resolve_transfer_spec` with unit tests; two verifier-script bugs). A
-  public Let's Encrypt certificate still needs a real DNS host; only the
-  internal localhost certificate has been observed on the runner.
+  (`scripts/verify_compose_stack.sh`, no continue-on-error) passed
+  end-to-end on a clean ubuntu-latest runner (run 40150132081) with the
+  earlier ten-section script: image build, live DB health, queued→completed
+  over real HTTP, independent output decode inside the worker container,
+  corrupt-input failure without partial output, worker restart durability,
+  leak scans and confirmation that port 8000 is never host-published. An
+  independent audit then found the verifier could delete repository data and
+  tear down a fixed-name project, and that the VPS installer had a 0777
+  fallback; all three were remediated (fully isolated mktemp working
+  directory, unique per-run Compose project/image, 0600 env file,
+  container-based chown with no world-writable path, an explicit
+  non-interference section, and eight regression tests in
+  `tests/unit/test_verifier_isolation.py`). The isolated eleven-section
+  script is re-proven on the runner by the `compose-smoke` job on the final
+  head; no operational claim is made until that run is green. A public
+  Let's Encrypt certificate still needs a real DNS host; only the internal
+  localhost certificate has been observed on the runner.
 - Long-media performance has been measured honestly in the two-core build
-  environment via `scripts/benchmark_long_media.sh`: the 30-minute case
-  takes 34.51s wall (target <15s) and the two-hour case 135.48s (target
-  <60s); pure stream-copy split alone is 0.90s/4.04s, so the mandatory
-  decode verification dominates. Neither target is met here, and the VPS
-  run that can close the criteria remains pending. Full matrix:
+  environment via `scripts/benchmark_long_media.sh` (latest run): the
+  30-minute case takes 28.30s wall (target <15s) and the two-hour case
+  121.25s (target <60s); pure stream-copy split alone is 0.90s/3.50s, so
+  the mandatory decode verification dominates. The script records media
+  characteristics and accepts representative real files via
+  `BENCH_30M_INPUT`/`BENCH_2H_INPUT`. Neither target is met here, and the
+  VPS run (or a documented criterion review with the optimization plan)
+  that can close the criteria remains pending. Full matrix:
   `D2_MVP/07_G2_EVIDENCE_LEDGER.md`.
 - A full secret-leak audit of every component has not been performed;
-  automated coverage currently targets the worker failure path.
+  automated coverage currently targets the worker failure path and the
+  container-log token scan inside compose-smoke.
 
 ### Not implemented (later milestones)
 

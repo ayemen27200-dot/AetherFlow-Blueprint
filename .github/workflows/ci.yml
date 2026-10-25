@@ -111,29 +111,22 @@ jobs:
           [[ -n "$PR_NUMBER" ]] || exit 0
           {
             echo "### compose-smoke failure diagnostics (run ${{ github.run_id }})"
+            echo "The verifier runs under a unique per-run Compose project in a"
+            echo "mktemp directory; the transcript below includes the container"
+            echo "state and per-service logs captured before its scoped teardown."
             echo '<details><summary>verifier output (tail)</summary>'
             echo '```text'
-            tail -c 20000 compose-run.log || true
-            echo '```'
-            echo '</details>'
-            echo '<details><summary>container state and logs captured before teardown</summary>'
-            echo '```text'
-            cat /tmp/aetherflow-compose-diag.log || echo "no diagnostic file was produced"
+            tail -c 50000 compose-run.log || true
             echo '```'
             echo '</details>'
           } > comment-body.md
           gh pr comment "$PR_NUMBER" --body-file comment-body.md
 
-      - name: Collect stack logs on failure
-        if: failure()
-        run: |
-          docker compose -f docker/docker-compose.yml logs --no-color \
-            > compose-smoke-logs.txt || true
-      - name: Upload failure logs
+      - name: Upload verifier transcript on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: compose-smoke-logs
-          path: compose-smoke-logs.txt
+          name: compose-smoke-transcript
+          path: compose-run.log
           if-no-files-found: ignore
           retention-days: 14

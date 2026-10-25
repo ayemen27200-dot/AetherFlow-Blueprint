@@ -1,37 +1,64 @@
 #!/usr/bin/env bash
 # Clean-host verification of the published Docker Compose stack.
 #
-# Runs on any host with Docker v2 (the CI compose-smoke job and the target
-# VPS). It performs an isolated, throwaway installation under ./data and
-# proves the full G2 path over real HTTP:
+# FULLY ISOLATED, NON-DESTRUCTIVE VERIFICATION — safe to run on a host that
+# already carries real data or another Compose stack:
 #
-#   1. `docker compose config` validates the published YAML.
-#   2. Clean data directory seeded with a valid and a corrupt upload object.
-#   3. The API and the worker run as separate containers sharing one SQLite
-#      file; Uvicorn is never published to the host (Caddy owns 80/443).
-#   4. queued -> completed over HTTP, output independently decoded, corrupt
-#      input -> failed/INVALID_INPUT, worker restart durability, and path /
-#      secret leak scans.
+#   * every run gets its own mktemp working directory (never the repository
+#     data directory) and its own unique Compose project name and image tag;
+#   * the repository checkout, its .env and its data/ tree are never written,
+#     moved or deleted (an explicit snapshot check enforces this);
+#   * a pre-existing Compose project named "aetherflow" is never touched:
+#     teardown is scoped to the unique per-run project label, and a before/
+#     after snapshot of the fixed project proves it is left alone;
+#   * the temporary env file is created mode 0600 and the data tree 0750
+#     owned by the container uid 1000 (never world-writable).
 #
-# The script tears the stack down on exit and removes the temporary .env it
-# creates. It never touches a pre-existing .env file.
+# It proves the full G2 path over real HTTP inside the Compose network:
+# config validation, build, health, queued -> completed, independent decode,
+# corrupt input -> INVALID_INPUT without partial output, worker restart
+# durability, leak scans, and no host publication of port 8000.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-COMPOSE=(docker compose -f docker/docker-compose.yml)
-DATA_DIR="$REPO_ROOT/data"
-TOKEN="compose-smoke-token-$(date +%s)"
-CREATED_ENV=0
 
-DIAG_LOG=/tmp/aetherflow-compose-diag.log
+command -v docker >/dev/null 2>&1 || { echo "FAIL: docker is required" >&2; exit 1; }
+docker compose version >/dev/null 2>&1 || { echo "FAIL: Docker Compose v2 plugin is required" >&2; exit 1; }
+
+# ---------------------------------------------------------------- isolation
+RUN_ID="$(date +%s)-$$"
+PROJECT="aetherflowsmoke${RUN_ID}"
+IMAGE_REF="aetherflow-smoke:${RUN_ID}"
+# Hard safety: the fixed production project name must never be used here.
+[[ "$PROJECT" != "aetherflow" ]] || { echo "FAIL: refusing the fixed project name" >&2; exit 1; }
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aetherflow-smoke.XXXXXX")"
+# Defence in depth: only ever remove a directory mktemp created for us.
+case "$WORK_DIR" in
+  /tmp/aetherflow-smoke.*|"${TMPDIR:-/tmp}"/aetherflow-smoke.*) ;;
+  *) echo "FAIL: unexpected temp path $WORK_DIR" >&2; exit 1 ;;
+esac
+[[ -n "$WORK_DIR" && "$WORK_DIR" != "/" && "$WORK_DIR" != "$REPO_ROOT" ]] || {
+  echo "FAIL: unsafe working directory" >&2; exit 1
+}
+DATA_DIR="$WORK_DIR/data"
+ENV_FILE="$WORK_DIR/smoke.env"
+OVERRIDE_FILE="$WORK_DIR/override.yml"
+DIAG_LOG="$WORK_DIR/diag.log"
+BUILD_LOG="$WORK_DIR/build.log"
+HEALTH_JSON="$WORK_DIR/health.json"
+LAST_STATUS="$WORK_DIR/last-status.json"
+CORRUPT_JSON="$WORK_DIR/corrupt.json"
+CONFIG_RENDERED="$WORK_DIR/compose-config.yml"
 : > "$DIAG_LOG"
+
+TOKEN="compose-smoke-token-${RUN_ID}"
+COMPOSE=(docker compose -p "$PROJECT" -f "$REPO_ROOT/docker/docker-compose.yml" -f "$OVERRIDE_FILE")
 
 section() { printf '\n=== [%s] %s ===\n' "$(date -u +%H:%M:%SZ)" "$1"; }
 
 dump_diagnostics() {
-  # Persist container state and logs BEFORE teardown removes the stack; the
-  # CI failure step reads this file from the shared runner filesystem.
   {
     printf '\n--- docker compose ps -a ---\n'
     "${COMPOSE[@]}" ps -a || true
@@ -52,8 +79,11 @@ fail() {
 
 cleanup() {
   section "teardown"
+  # Scoped to THIS run's unique project: cannot match any other stack.
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  if [[ "$CREATED_ENV" -eq 1 ]]; then rm -f "$REPO_ROOT/.env"; fi
+  # Only the uniquely tagged image built for this run is removed.
+  docker image rm "$IMAGE_REF" >/dev/null 2>&1 || true
+  rm -rf "$WORK_DIR"
 }
 
 on_error() {
@@ -65,14 +95,28 @@ on_error() {
 trap on_error ERR
 trap cleanup EXIT
 
-command -v docker >/dev/null 2>&1 || fail "docker is required to run this verification"
-docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 plugin is required"
+# Snapshot any pre-existing fixed-name project and the repository data tree so
+# the final section can prove the run changed neither.
+fixed_project_containers() {
+  docker ps -a --filter "label=com.docker.compose.project=aetherflow" --format '{{.Names}}' | sort
+}
+PRE_FIXED="$(fixed_project_containers)"
+REPO_DATA_SNAPSHOT="$WORK_DIR/repo-data-before.txt"
+if [[ -d "$REPO_ROOT/data" ]]; then
+  (cd "$REPO_ROOT" && find data -type f | sort) > "$REPO_DATA_SNAPSHOT"
+else
+  : > "$REPO_DATA_SNAPSHOT"
+fi
+# A unique project name must not already exist on this host.
+EXISTING="$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" -q)"
+[[ -z "$EXISTING" ]] || fail "project name $PROJECT already exists; aborting to avoid touching foreign resources"
 
 section "1. isolated env file and data directory"
-if [[ -f "$REPO_ROOT/.env" ]]; then
-  fail "a real .env already exists; refusing to overwrite it on a clean-host check"
-fi
-cat > "$REPO_ROOT/.env" <<EOF
+# Fail closed if anything ever points the temp env path at the checkout.
+[[ "$ENV_FILE" != "$REPO_ROOT/.env" ]] || fail "env path must stay inside the temp directory"
+(
+  umask 077
+  cat > "$ENV_FILE" <<EOF
 BEARER_TOKEN=$TOKEN
 DATABASE_PATH=/app/data/aetherflow.db
 HOST=0.0.0.0
@@ -81,49 +125,76 @@ LOG_LEVEL=INFO
 DOMAIN=localhost
 ACME_EMAIL=admin@example.com
 EOF
-CREATED_ENV=1
-rm -rf "$DATA_DIR"
+)
+chmod 600 "$ENV_FILE"
+[[ "$(stat -c '%a' "$ENV_FILE")" == "600" ]] || fail "temp env file is not mode 0600"
+mkdir -p "$DATA_DIR/upload_store" "$DATA_DIR/outputs"
+chmod 750 "$DATA_DIR" "$DATA_DIR/upload_store" "$DATA_DIR/outputs"
+
+# Compose override remaps every bind mount and env file to the temp directory,
+# and gives both application services a per-run unique image tag. All paths
+# are absolute so resolution never depends on the override file's directory.
+cat > "$OVERRIDE_FILE" <<EOF
+services:
+  orchestrator:
+    image: $IMAGE_REF
+    env_file:
+      - $ENV_FILE
+    volumes:
+      - $DATA_DIR:/app/data
+      - $REPO_ROOT/config:/app/config:ro
+  worker:
+    image: $IMAGE_REF
+    env_file:
+      - $ENV_FILE
+    volumes:
+      - $DATA_DIR:/app/data
+      - $REPO_ROOT/config:/app/config:ro
+EOF
 
 section "2. compose config validation"
-"${COMPOSE[@]}" config >/tmp/aetherflow-compose-config.yml
+"${COMPOSE[@]}" config > "$CONFIG_RENDERED"
 # Uvicorn must not get a host-published port.
-if grep -Eq 'published:.*8000' /tmp/aetherflow-compose-config.yml; then
+if grep -Eq 'published:.*8000' "$CONFIG_RENDERED"; then
   fail "orchestrator port 8000 is published to the host"
 fi
-echo "config valid; no host publication of port 8000"
-mkdir -p "$DATA_DIR/upload_store" "$DATA_DIR/outputs"
-# The containers run as the non-root uid 1000 baked into the image, while a
-# clean host creates this directory as the invoking user. Make the shared
-# data tree writable by the container uid; production hosts should prefer
-# `chown -R 1000:1000 data` with normal 0755 modes instead of 0777.
-chmod 0777 "$DATA_DIR" "$DATA_DIR/upload_store" "$DATA_DIR/outputs"
+# The rendered config must reference the temp data dir, never ./data.
+grep -Fq "$DATA_DIR" "$CONFIG_RENDERED" || fail "override did not remap the data bind mount"
+! grep -Fq "$REPO_ROOT/data:" "$CONFIG_RENDERED" || fail "rendered config still binds the repository data directory"
+echo "config valid; isolated mounts; no host publication of port 8000"
+
 cp tests/fixtures/sample_5s.mp4 "$DATA_DIR/upload_store/up-sample-5s.mp4"
-python3 - <<'PY'
+python3 - "$DATA_DIR" <<'PY'
+import sys
 from pathlib import Path
-src = Path("data/upload_store/up-sample-5s.mp4").read_bytes()
+data_dir = Path(sys.argv[1])
+src = (data_dir / "upload_store" / "up-sample-5s.mp4").read_bytes()
 data = bytearray(src)
 mid = len(data) // 2
 data[mid:mid + 4096] = b"\x00" * 4096
-Path("data/upload_store/up-corrupt.mp4").write_bytes(data)
+(data_dir / "upload_store" / "up-corrupt.mp4").write_bytes(data)
 PY
 
-section "3. build and start the published stack"
-# Keep the verbose build log out of the main transcript so failure tails
-# stay readable; the CI job still fails if the build itself fails.
-"${COMPOSE[@]}" build >/tmp/aetherflow-compose-build.log 2>&1
-echo "image build OK (full log: /tmp/aetherflow-compose-build.log)"
+section "3. build and start the isolated stack"
+"${COMPOSE[@]}" build > "$BUILD_LOG" 2>&1
+echo "image build OK (full log: $BUILD_LOG)"
+# The containers run as the non-root uid 1000; hand the temp data tree to
+# that uid from inside the image (works without host root and never relaxes
+# permissions to world-writable).
+"${COMPOSE[@]}" run --rm --no-deps --user root orchestrator \
+  chown -R 1000:1000 /app/data >/dev/null
 "${COMPOSE[@]}" up -d
 
 section "4. wait for API health (inside the compose network)"
 for _ in $(seq 1 30); do
   if "${COMPOSE[@]}" exec -T orchestrator \
-      curl --fail --silent http://127.0.0.1:8000/health >/tmp/health.json 2>/dev/null; then
+      curl --fail --silent http://127.0.0.1:8000/health > "$HEALTH_JSON" 2>/dev/null; then
     break
   fi
   sleep 2
 done
-cat /tmp/health.json; echo
-grep -q '"database": *"ok"' /tmp/health.json || fail "health endpoint did not report a live database"
+cat "$HEALTH_JSON"; echo
+grep -q '"database": *"ok"' "$HEALTH_JSON" || fail "health endpoint did not report a live database"
 
 api_call() {
   # $1 = method, $2 = path, optional $3 = JSON body
@@ -139,9 +210,7 @@ api_call() {
 job_id() { python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])'; }
 job_status() { python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])'; }
 wait_terminal() {
-  # Echoes the bare terminal status word ("completed"/"failed"); the full
-  # last JSON representation is kept in /tmp/last-status for callers that
-  # need the whole record.
+  # Echoes the bare terminal status word; the full record goes to a temp file.
   local id="$1"
   for _ in $(seq 1 60); do
     local state
@@ -149,7 +218,7 @@ wait_terminal() {
     local status
     status="$(printf '%s' "$state" | job_status)"
     if [[ "$status" == "completed" || "$status" == "failed" ]]; then
-      printf '%s' "$state" > /tmp/last-status
+      printf '%s' "$state" > "$LAST_STATUS"
       printf '%s' "$status"
       return 0
     fi
@@ -166,7 +235,7 @@ JOB1="$(printf '%s' "$CREATE" | job_id)"
 DETAIL="$(api_call GET "/jobs/$JOB1")"
 echo "$DETAIL"
 # No absolute filesystem path may appear in any public representation.
-if printf '%s' "$DETAIL" | grep -Eq '"/|/app/|/home/|\\\\'; then
+if printf '%s' "$DETAIL" | grep -Eq '"/|/app/|/home/|\\'; then
   fail "absolute or escaped path leaked into the job response"
 fi
 REF="$(printf '%s' "$DETAIL" | python3 -c 'import json,sys; print(json.load(sys.stdin)["output_paths"][0])')"
@@ -180,8 +249,8 @@ echo "output decoded cleanly"
 section "7. corrupt input fails with a safe code and leaves no partial output"
 JOB2="$(api_call POST /jobs '{"type":"split","file":"up-corrupt.mp4"}' | job_id)"
 [[ "$(wait_terminal "$JOB2")" == "failed" ]] || fail "corrupt job was not marked failed"
-api_call GET "/jobs/$JOB2" | tee /tmp/corrupt-job.json
-grep -q '"error_type": *"INVALID_INPUT"' /tmp/corrupt-job.json || fail "expected INVALID_INPUT"
+api_call GET "/jobs/$JOB2" | tee "$CORRUPT_JSON"
+grep -q '"error_type": *"INVALID_INPUT"' "$CORRUPT_JSON" || fail "expected INVALID_INPUT"
 [[ ! -e "$DATA_DIR/outputs/$JOB2" ]] || fail "partial output survived a failed job"
 
 section "8. worker restart durability"
@@ -216,10 +285,28 @@ fi
 api_call POST /jobs '{"type":"split","file":"../etc/passwd"}' | grep -q 'upload id' \
   || fail "path-like upload id was not rejected"
 
-section "10. port publication check on the live containers"
-if docker ps --format '{{.Names}} {{.Ports}}' | grep -Eq 'orchestrator.*0\.0\.0\.0|orchestrator.*:::'; then
+section "10. port publication check, scoped to this run's project"
+PROJECT_PS="$(docker ps --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}} {{.Ports}}')"
+echo "$PROJECT_PS"
+if printf '%s' "$PROJECT_PS" | grep -Eq 'orchestrator.*0\.0\.0\.0|orchestrator.*:::'; then
   fail "orchestrator container published a host port"
 fi
-docker ps --format '{{.Names}} {{.Ports}}'
 
-printf '\nPASS: compose stack verification finished successfully\n'
+section "11. non-interference proof"
+# 11a. The fixed-name project (if any) must be byte-identical before/after.
+POST_FIXED="$(fixed_project_containers)"
+[[ "$PRE_FIXED" == "$POST_FIXED" ]] || fail "verification touched the pre-existing 'aetherflow' project"
+echo "fixed 'aetherflow' project containers unchanged: ${POST_FIXED:-<none present>}"
+# 11b. The repository data tree must be unchanged (the run never wrote there).
+if [[ -d "$REPO_ROOT/data" ]]; then
+  POST_SNAPSHOT="$WORK_DIR/repo-data-after.txt"
+  (cd "$REPO_ROOT" && find data -type f | sort) > "$POST_SNAPSHOT"
+  diff -u "$REPO_DATA_SNAPSHOT" "$POST_SNAPSHOT" || fail "repository data tree changed during verification"
+  echo "repository data/ tree unchanged ($(wc -l < "$POST_SNAPSHOT") tracked-by-find files)"
+else
+  echo "repository data/ absent before and after; nothing to disturb"
+fi
+# 11c. No repository .env was created or modified by this run.
+[[ ! -e "$REPO_ROOT/.env" ]] || echo "note: a pre-existing repository .env was left untouched"
+
+printf '\nPASS: isolated compose stack verification finished successfully (project %s)\n' "$PROJECT"

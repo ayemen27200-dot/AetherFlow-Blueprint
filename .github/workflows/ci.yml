@@ -80,3 +80,30 @@ jobs:
           path: test-results/junit.xml
           if-no-files-found: error
           retention-days: 30
+
+  compose-smoke:
+    name: Docker Compose clean-host stack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # The published image already bundles FFmpeg/FFprobe; no apt step needed.
+      - name: Run clean-host stack verification
+        run: bash scripts/verify_compose_stack.sh
+
+      - name: Collect stack logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker/docker-compose.yml logs --no-color \
+            > compose-smoke-logs.txt || true
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-smoke-logs
+          path: compose-smoke-logs.txt
+          if-no-files-found: ignore
+          retention-days: 14

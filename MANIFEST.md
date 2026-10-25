@@ -8,7 +8,7 @@
 |---|---:|---|
 | D0 Master Blueprint | 2 | Project constitution and architecture |
 | D1 Foundation | 12 | Plantree, SQLite schema, OpenAPI 3.1, policy/config examples, checkpoint/model lock, runbook, license and delivery notes |
-| D2 MVP | 11 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria, delivery note, living G2 evidence ledger and the Task016–Task019 acceptance, audit and criterion-review reports |
+| D2 MVP | 12 | MVP scope, implementation map, FFmpeg plan, SQLite queue, acceptance criteria, delivery note, living G2 evidence ledger and the Task016–Task020 acceptance, audit, criterion-review and verification-concurrency reports |
 | D3 Core Engine | 7 | ASR, agent protocol, SSE, web UI, Tailscale, acceptance criteria and delivery note |
 | D4 Cloud Scale | 7 | ProPainter/mask policy, Modal, quota management, LiteLLM, Telegram, acceptance criteria and delivery note |
 | D5 Hardening | 7 | Test, security, accessibility, backup, CI/CD, release and delivery plans |

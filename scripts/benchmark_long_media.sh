@@ -36,6 +36,9 @@ SRC="$BENCH/src"
 OUT="$BENCH/out"
 FIXTURE="$REPO_ROOT/tests/fixtures/sample_5s.mp4"
 SEGMENT_SECONDS=300
+# Reviewer requirement: three full-path runs per duration; overridable for
+# quick smoke checks, never for acceptance evidence.
+REPEATS="${BENCH_REPEATS:-3}"
 rm -rf "$BENCH"
 mkdir -p "$SRC" "$OUT"
 
@@ -95,6 +98,19 @@ specs() {
   echo "- disk: $(df -P "$BENCH" | tail -1 | awk '{print $2" KiB total, "$4" KiB free"}')"
   echo "- ffmpeg: $("$FFMPEG" -hide_banner -version | head -1)"
   echo "- ffprobe: ${FFPROBE:-not available (banner fallback used)}"
+  echo "- code_head: $(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  echo "- code_dirty: $(test -n "$(git status --porcelain -- executors agent 2>/dev/null)" && echo yes || echo no)"
+  echo "- verify_concurrency_env: ${AETHERFLOW_VERIFY_CONCURRENCY:-<default>}"
+  echo "- repeats_per_duration: $REPEATS"
+}
+
+summarise() {
+  # Emits "median min" for the whitespace-separated seconds passed as args.
+  python3 -c '
+import statistics, sys
+values = [float(v) for v in sys.argv[1:]]
+print(f"{statistics.median(values):.2f} {min(values):.2f}")
+' "$@"
 }
 
 prepare_input() {
@@ -117,9 +133,10 @@ prepare_input() {
 run_case() {
   # $1 = label, $2 = nominal seconds, $3 = concat entries, $4 = ceiling, $5 = real-file env var
   local label="$1" seconds="$2" entries="$3" ceiling="$4" env_name="$5"
-  local job_out="$OUT/$label" raw_out="$OUT/raw-$label"
-  mkdir -p "$job_out" "$raw_out"
-  local prepared kind input size duration parts wall split_only info
+  local case_out="$OUT/$label" raw_out="$OUT/raw-$label"
+  mkdir -p "$case_out" "$raw_out"
+  local prepared kind input size duration parts split_only info run_n job_out result
+  local -a walls=()
   prepared="$(prepare_input "$label" "$entries" "$env_name")"
   kind="${prepared%%|*}"
   input="${prepared#*|}"
@@ -130,15 +147,32 @@ run_case() {
   split_only=$(elapsed "\"$FFMPEG\" -hide_banner -nostdin -y -i \"$input\" -map 0 -c copy \
     -f segment -segment_time $SEGMENT_SECONDS -reset_timestamps 1 \
     \"$raw_out/part_%03d.mp4\" >/dev/null 2>&1")
-  echo "Running full executor benchmark (with decode verification) for $label..." >&2
-  wall=$(elapsed "\"$AETHERFLOW\" split \"$input\" --allowed-base \"$SRC\" \
-    --output-dir \"$job_out\" --segment-seconds $SEGMENT_SECONDS --ffmpeg \"$FFMPEG\" \
-    > \"$job_out/result.json\"")
+  for ((run_n = 1; run_n <= REPEATS; run_n++)); do
+    job_out="$case_out/run-$run_n"
+    mkdir -p "$job_out"
+    result="$job_out/result.json"
+    echo "[$label] full executor run $run_n/$REPEATS (with decode verification)..." >&2
+    walls+=("$(elapsed "\"$AETHERFLOW\" split \"$input\" --allowed-base \"$SRC\" \
+      --output-dir \"$job_out\" --segment-seconds $SEGMENT_SECONDS --ffmpeg \"$FFMPEG\" \
+      > \"$result\"")")
+  done
+  # All repeats use the same input, so structural stats come from the last run.
   parts=$(find "$job_out" -name 'part_*.mp4' | wc -l)
-  duration=$(python3 -c 'import json; print(json.load(open("'"$job_out/result.json"'"))["outputs_duration_sec"])')
-  printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
-    "$label" "$kind" "$seconds" "$size" "$parts" "$duration" "$split_only" "$wall" "$ceiling"
+  duration=$(python3 -c 'import json; print(json.load(open("'"$result"'"))["outputs_duration_sec"])')
+  local summary median min_wall verdict
+  summary="$(summarise "${walls[@]}")"
+  median="${summary%% *}"
+  min_wall="${summary##* }"
+  verdict=$(awk -v m="$median" -v c="$ceiling" 'BEGIN { print (m < c) ? "PASS" : "OPEN" }')
+  printf '| %s | %s | %s | %s | %s | %s | %s |' \
+    "$label" "$kind" "$seconds" "$size" "$parts" "$duration" "$split_only"
+  local wall
+  for wall in "${walls[@]}"; do
+    printf ' %s |' "$wall"
+  done
+  printf ' %s | %s | %s | %s |\n' "$median" "$min_wall" "$ceiling" "$verdict"
   echo "  - ${label} media characteristics: ${info}"
+  echo "  - ${label} full wall per run (s): ${walls[*]}; median=${median}, min=${min_wall}"
 }
 
 {
@@ -146,15 +180,32 @@ run_case() {
   echo
   specs
   echo
-  echo "Wall time is the full executor path including mandatory decode"
-  echo "verification of the input and every output part; split-only times the"
-  echo "raw FFmpeg stream-copy command without verification. Synthetic inputs"
+  echo "Wall time is the full executor path including mandatory full decode"
+  echo "verification of the input and every output part (exit 0 plus an empty"
+  echo "error stream); split-only times the raw FFmpeg stream-copy command"
+  echo "without verification. Each duration runs $REPEATS full-path repeats;"
+  echo "the verdict compares the median wall against the target ceiling, and"
+  echo "every per-run value is shown so spread is reviewable. Synthetic inputs"
   echo "repeat the committed 5-second fixture's GOP/bitrate/codec and are not"
   echo "representative of all production media; representative real files can"
   echo "be supplied via BENCH_30M_INPUT and BENCH_2H_INPUT."
   echo
-  echo "| Input | Source | Nominal duration (s) | File size (bytes) | Parts | Output duration (s) | Split-only (s) | Full wall (s) | Target ceiling (s) |"
-  echo "|---|---|---:|---:|---:|---:|---:|---:|---:|"
+  {
+    printf '| Input | Source | Nominal duration (s) | File size (bytes) | Parts | Output duration (s) | Split-only (s) |'
+    local_i=1
+    while ((local_i <= REPEATS)); do
+      printf ' Full wall run %s (s) |' "$local_i"
+      local_i=$((local_i + 1))
+    done
+    printf ' Median wall (s) | Min wall (s) | Target ceiling (s) | Verdict |\n'
+    printf '|---|---|---:|---:|---:|---:|---:|'
+    local_i=1
+    while ((local_i <= REPEATS)); do
+      printf '%s' '---:|'
+      local_i=$((local_i + 1))
+    done
+    printf '%s\n' '---:|---:|---:|---|'
+  }
   run_case "30m" 1800 360 15 "BENCH_30M_INPUT"
   run_case "2h" 7200 1440 60 "BENCH_2H_INPUT"
 } | tee "$BENCH/RESULTS.md"

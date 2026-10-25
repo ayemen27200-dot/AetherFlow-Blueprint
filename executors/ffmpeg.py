@@ -34,11 +34,19 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .base import Executor
+
+# Bounded verification pool defaults. FFmpeg children are separate processes,
+# so threads only wait on subprocess completion (the GIL is released while
+# waiting) and the pool gives real parallel decode on multi-core hosts.
+_VERIFY_CONCURRENCY_ENV = "AETHERFLOW_VERIFY_CONCURRENCY"
+_DEFAULT_VERIFY_WORKER_CAP = 8
+_MAX_VERIFY_WORKERS = 32
 
 # Reuse the project's transfer contract for size/extension limits.
 _PACKAGE_SPEC = Path(__file__).resolve().parents[1] / "config" / "file_transfer_spec.yaml"
@@ -198,6 +206,7 @@ class FFmpegSplitExecutor(Executor):
         ffprobe_cmd: str | None = None,
         progress_step: float = _PROGRESS_STEP,
         probe_timeout_sec: float = 60.0,
+        verify_concurrency: int | None = None,
     ) -> None:
         if segment_sec <= 0:
             raise ValueError("segment_sec must be positive")
@@ -205,6 +214,9 @@ class FFmpegSplitExecutor(Executor):
             raise ValueError("timeout_sec must be positive")
         if probe_timeout_sec <= 0:
             raise ValueError("probe_timeout_sec must be positive")
+        self.verify_concurrency = self._resolve_verify_concurrency(
+            verify_concurrency
+        )
         self.segment_sec = segment_sec
         self.timeout_sec = float(timeout_sec)
         self.probe_timeout_sec = float(probe_timeout_sec)
@@ -224,6 +236,30 @@ class FFmpegSplitExecutor(Executor):
         self.ffprobe_cmd = ffprobe_cmd or shutil.which("ffprobe")
         self.progress_step = progress_step
 
+    @staticmethod
+    def _resolve_verify_concurrency(explicit: int | None) -> int:
+        """Pick the bounded verification-pool size.
+
+        Order: an explicit constructor value, the
+        ``AETHERFLOW_VERIFY_CONCURRENCY`` environment variable, then a capped
+        CPU-count default. Invalid environment values are ignored rather than
+        crashing a worker at startup; invalid explicit values are a programming
+        error and raise.
+        """
+        if explicit is not None:
+            if not isinstance(explicit, int) or explicit < 1:
+                raise ValueError("verify_concurrency must be a positive integer")
+            return min(explicit, _MAX_VERIFY_WORKERS)
+        raw = os.environ.get(_VERIFY_CONCURRENCY_ENV)
+        if raw:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                value = 0
+            if value >= 1:
+                return min(value, _MAX_VERIFY_WORKERS)
+        return min(_DEFAULT_VERIFY_WORKER_CAP, os.cpu_count() or 1)
+
     @classmethod
     def from_config(
         cls,
@@ -235,6 +271,7 @@ class FFmpegSplitExecutor(Executor):
         timeout_sec: float = 3600.0,
         ffmpeg_cmd: str | None = None,
         ffprobe_cmd: str | None = None,
+        verify_concurrency: int | None = None,
     ) -> FFmpegSplitExecutor:
         """Build an executor whose limits come from the transfer YAML only."""
         import yaml
@@ -251,6 +288,7 @@ class FFmpegSplitExecutor(Executor):
             timeout_sec=timeout_sec,
             ffmpeg_cmd=ffmpeg_cmd,
             ffprobe_cmd=ffprobe_cmd,
+            verify_concurrency=verify_concurrency,
         )
 
     # ------------------------------------------------------------------ run
@@ -261,28 +299,72 @@ class FFmpegSplitExecutor(Executor):
         *,
         cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        """Validate, probe, split and verify. Raises an :class:`ExecutorError`."""
+        """Validate, probe, split and verify. Raises an :class:`ExecutorError`.
+
+        Verification scheduling (the strict pass/fail rules are unchanged —
+        the input and every output part still get a full null decode with
+        ``-xerror`` requiring exit 0 and an empty error stream):
+
+        * the input's full decode starts in a bounded pool and overlaps the
+          stream-copy split, so its CPU time is not paid serially up front;
+        * every output part is then verified by a pool worker running the
+          same :meth:`probe` two-pass check, capped at
+          ``verify_concurrency`` concurrent FFmpeg children.
+        """
         job_id, input_path = self._validate_spec(job_spec)
         source = self._validate_input(input_path)
         output_dir, output_pattern = self._prepare_output(job_id, source)
         try:
-            media = self.probe(source)
+            media = self._read_media_info(source)
+            with ThreadPoolExecutor(
+                max_workers=self.verify_concurrency,
+                thread_name_prefix="aetherflow-verify",
+            ) as pool:
+                # Start the mandatory full input decode immediately so it runs
+                # concurrently with the split subprocess below.
+                input_decode = pool.submit(self._decode_media, source)
 
-            argv = self._build_argv(source, output_pattern)
-            parser = ProgressParser(
-                media.duration_sec, on_progress, step=self.progress_step
-            )
-            returncode = self._run_subprocess(argv, parser, cancel_event)
-            if returncode != 0:
-                self._classify_nonzero_exit(returncode, cancel_event)
+                argv = self._build_argv(source, output_pattern)
+                parser = ProgressParser(
+                    media.duration_sec, on_progress, step=self.progress_step
+                )
+                returncode = self._run_subprocess(argv, parser, cancel_event)
+                if returncode != 0:
+                    self._classify_nonzero_exit(returncode, cancel_event)
 
-            result = self._verify_outputs(output_dir, output_pattern, media, job_id)
+                # Part probes are scheduled into the same pool, so they run
+                # concurrently with the still-in-flight input decode; input
+                # integrity keeps precedence in error classification inside.
+                result = self._verify_outputs(
+                    output_dir,
+                    output_pattern,
+                    media,
+                    job_id,
+                    pool=pool,
+                    input_future=input_decode,
+                )
         except ExecutorError:
             # Never leave partial segments that could be mistaken for outputs.
             self._discard_partial_output(output_dir)
             raise
         parser.finish()
         return result
+
+    def _read_media_info(self, source: Path) -> MediaInfo:
+        """Metadata-only read used to size progress before the split.
+
+        The mandatory integrity decode still happens separately via
+        :meth:`_decode_media`; a readable header alone never implies
+        decodability. Uses ffprobe when available, otherwise the FFmpeg
+        banner duration (no full decode in this metadata step).
+        """
+        info = self._probe_with_ffprobe(source) if self.ffprobe_cmd else None
+        if info is None:
+            duration = self._read_banner_duration(source)
+            if duration is None:
+                raise ExecutorInputError("input media could not be validated")
+            return MediaInfo(duration_sec=duration, decodable=False)
+        return MediaInfo(duration_sec=info.duration_sec, decodable=False)
 
     def _discard_partial_output(self, output_dir: Path) -> None:
         """Remove a job directory we created, but only inside the trusted base."""
@@ -602,32 +684,102 @@ class FFmpegSplitExecutor(Executor):
         raise ExecutorToolError(f"media tool exited with code {returncode}")
 
     # --------------------------------------------------------------- outputs
+    def _verify_part(self, part: Path) -> tuple[Path, MediaInfo, int]:
+        """Strict per-part check: non-empty file plus the full two-pass probe.
+
+        Runs inside a pool worker and touches no shared mutable state, so the
+        same check is safe to execute concurrently for several parts.
+        """
+        if not part.is_file() or part.stat().st_size == 0:
+            raise ExecutorToolError("an output part is missing or empty")
+        try:
+            info = self.probe(part)
+        except ExecutorInputError as exc:
+            raise ExecutorToolError(
+                "an output part failed media validation"
+            ) from exc
+        if not info.decodable:
+            raise ExecutorToolError("an output part failed media validation")
+        return part, info, part.stat().st_size
+
+    def _raise_if_input_unverified(
+        self, input_future: Future[bool]
+    ) -> None:
+        """Gate part aggregation on the mandatory full decode of the input.
+
+        Keeps the historical error classification (unreadable/corrupt input ->
+        :class:`ExecutorInputError`) even though the decode now overlaps the
+        split and the part probes instead of running serially up front.
+        """
+        try:
+            input_ok = input_future.result(timeout=self.probe_timeout_sec)
+        except TimeoutError as exc:
+            raise ExecutorToolError(
+                "media verification exceeded its time limit"
+            ) from exc
+        if not input_ok:
+            raise ExecutorInputError("input media could not be validated")
+
     def _verify_outputs(
         self,
         output_dir: Path,
         output_pattern: Path,
         media: MediaInfo,
         job_id: str,
+        *,
+        pool: ThreadPoolExecutor | None = None,
+        input_future: Future[bool] | None = None,
     ) -> dict[str, Any]:
+        """Validate every produced part; failure raises an ``ExecutorError``.
+
+        The strict per-part contract is unchanged (existence, non-empty size,
+        full null decode via :meth:`probe` requiring exit 0 and an empty error
+        stream); only the scheduling differs — probes run in the bounded
+        ``pool`` instead of serially. Part checks and the input decode (when
+        ``input_future`` is supplied) execute concurrently, but input integrity
+        is awaited first so its error classification keeps precedence. Results
+        are aggregated in deterministic filename order, and any failure fails
+        closed by cancelling all checks that have not started yet.
+        """
         suffix = output_pattern.suffix
         parts = sorted(output_dir.glob(f"*{suffix}"))
         if not parts:
             raise ExecutorToolError("processing produced no output files")
+
+        owns_pool = pool is None
+        if owns_pool:
+            pool = ThreadPoolExecutor(
+                max_workers=min(self.verify_concurrency, len(parts)),
+                thread_name_prefix="aetherflow-verify",
+            )
+        try:
+            futures = {
+                pool.submit(self._verify_part, part): part for part in parts
+            }
+            results: dict[Path, tuple[Path, MediaInfo, int]] = {}
+            try:
+                if input_future is not None:
+                    self._raise_if_input_unverified(input_future)
+                # Gather in submission (filename) order so error messages and
+                # output ordering stay deterministic regardless of finish time.
+                for future, part in futures.items():
+                    results[part] = future.result()
+            except BaseException:
+                for pending in futures:
+                    pending.cancel()
+                raise
+        finally:
+            if owns_pool:
+                pool.shutdown(wait=True)
+
         outputs: list[str] = []
         total_duration = 0.0
         total_bytes = 0
         for part in parts:
-            if not part.is_file() or part.stat().st_size == 0:
-                raise ExecutorToolError("an output part is missing or empty")
-            try:
-                info = self.probe(part)
-            except ExecutorInputError as exc:
-                raise ExecutorToolError("an output part failed media validation") from exc
-            if not info.decodable:
-                raise ExecutorToolError("an output part failed media validation")
+            _, info, size = results[part]
             outputs.append(str(part))
             total_duration += info.duration_sec
-            total_bytes += part.stat().st_size
+            total_bytes += size
 
         expected = media.duration_sec
         if expected > 0 and abs(total_duration - expected) > expected * _DURATION_TOLERANCE:

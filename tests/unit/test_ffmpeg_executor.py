@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -104,6 +105,27 @@ def make_media(tmp_path: Path, name: str = "clip.mp4", size: int = 100) -> Path:
     path = tmp_path / "inbox" / name
     path.write_bytes(b"x" * size)
     return path
+
+
+def patch_input_media_seams(
+    monkeypatch: pytest.MonkeyPatch,
+    executor: FFmpegSplitExecutor,
+    *,
+    duration: float = 5.0,
+    decode_ok: bool = True,
+) -> None:
+    """Replace the real-binary media seams used by ``run()``.
+
+    ``run()`` now splits the old single ``probe(source)`` call into a
+    metadata-only read (sizes the progress bar) and a full integrity decode
+    (overlapped with the split), so run-level fakes patch both seams.
+    """
+    monkeypatch.setattr(
+        executor,
+        "_read_media_info",
+        lambda source: MediaInfo(duration_sec=duration, decodable=False),
+    )
+    monkeypatch.setattr(executor, "_decode_media", lambda source: decode_ok)
 
 
 # --------------------------------------------------------------------------- #
@@ -471,6 +493,7 @@ def test_full_run_happy_path_with_fakes(
     executor: FFmpegSplitExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     media = make_media(tmp_path)
+    patch_input_media_seams(monkeypatch, executor)
     monkeypatch.setattr(
         executor, "probe", lambda path: MediaInfo(duration_sec=5.0, decodable=True)
     )
@@ -480,7 +503,9 @@ def test_full_run_happy_path_with_fakes(
         lambda argv: FakeProcess(["out_time_us=2500000\n", "progress=end\n"]),
     )
 
-    def fake_verify(output_dir, output_pattern, media_info, job_id):
+    def fake_verify(
+        output_dir, output_pattern, media_info, job_id, *, pool=None, input_future=None
+    ):
         part = output_dir / "part_000.mp4"
         part.write_bytes(b"segment-bytes")
         return {
@@ -506,6 +531,7 @@ def test_full_run_nonzero_exit_raises_tool_error(
     executor: FFmpegSplitExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     media = make_media(tmp_path)
+    patch_input_media_seams(monkeypatch, executor)
     monkeypatch.setattr(
         executor, "probe", lambda path: MediaInfo(duration_sec=5.0, decodable=True)
     )
@@ -513,7 +539,44 @@ def test_full_run_nonzero_exit_raises_tool_error(
     with pytest.raises(ExecutorToolError, match="code 1"):
         executor.run({"job_id": "job-2", "input_path": str(media)}, lambda _: None)
     # No success claims without verified outputs, and messages stay path-free.
+    assert not (tmp_path / "outbox" / "job-2").exists()
     assert not list((tmp_path / "outbox" / "job-2").glob("*.mp4"))
+
+
+def test_full_run_input_decode_failure_discards_outputs(
+    executor: FFmpegSplitExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A header-readable file whose mandatory full decode fails must fail the
+    # job even when the split itself succeeds and every part looks valid.
+    media = make_media(tmp_path)
+    patch_input_media_seams(monkeypatch, executor, decode_ok=False)
+    monkeypatch.setattr(
+        executor,
+        "_popen",
+        lambda argv: FakeProcess(["out_time_us=2500000\n", "progress=end\n"]),
+    )
+
+    def fake_verify(
+        output_dir, output_pattern, media_info, job_id, *, pool=None, input_future=None
+    ):
+        if input_future is not None and not input_future.result(timeout=5):
+            raise ExecutorInputError("input media could not be validated")
+        part = output_dir / "part_000.mp4"
+        part.write_bytes(b"segment-bytes")
+        return {
+            "job_id": job_id,
+            "outputs": [str(part)],
+            "segment_count": 1,
+            "source_duration_sec": 5.0,
+            "outputs_duration_sec": 5.0,
+            "total_bytes": part.stat().st_size,
+            "segment_sec": 3,
+        }
+
+    monkeypatch.setattr(executor, "_verify_outputs", fake_verify)
+    with pytest.raises(ExecutorInputError, match="could not be validated"):
+        executor.run({"job_id": "job-3", "input_path": str(media)}, lambda _: None)
+    assert not (tmp_path / "outbox" / "job-3").exists()
 
 
 def test_from_config_reads_project_transfer_contract(tmp_path: Path) -> None:
@@ -572,3 +635,167 @@ def test_resolve_transfer_spec_missing_everywhere_is_path_free(
     with pytest.raises(FileNotFoundError) as excinfo:
         ffmpeg_mod.resolve_transfer_spec()
     assert str(tmp_path) not in str(excinfo.value)
+
+# --------------------------------------------------------------------------- #
+# Verification pool: concurrency limit, fail-closed behavior and overlap
+# --------------------------------------------------------------------------- #
+
+
+def _make_parts(out_dir: Path, count: int) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pattern = out_dir / "part_%03d.mp4"
+    for index in range(count):
+        (out_dir / f"part_{index:03d}.mp4").write_bytes(b"segment-bytes")
+    return pattern
+
+
+def test_verify_concurrency_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def build(**kwargs: object) -> FFmpegSplitExecutor:
+        return FFmpegSplitExecutor(
+            3,
+            allowed_base_dir=tmp_path / "in",
+            output_base_dir=tmp_path / "out",
+            **kwargs,
+        )
+
+    monkeypatch.delenv("AETHERFLOW_VERIFY_CONCURRENCY", raising=False)
+    defaulted = build()
+    assert defaulted.verify_concurrency == min(8, os.cpu_count() or 1)
+    assert build(verify_concurrency=1).verify_concurrency == 1
+    assert build(verify_concurrency=100).verify_concurrency == 32
+    with pytest.raises(ValueError):
+        build(verify_concurrency=0)
+
+    monkeypatch.setenv("AETHERFLOW_VERIFY_CONCURRENCY", "4")
+    assert build().verify_concurrency == 4
+    monkeypatch.setenv("AETHERFLOW_VERIFY_CONCURRENCY", "100")
+    assert build().verify_concurrency == 32
+    monkeypatch.setenv("AETHERFLOW_VERIFY_CONCURRENCY", "garbage")
+    assert build().verify_concurrency == min(8, os.cpu_count() or 1)
+    monkeypatch.setenv("AETHERFLOW_VERIFY_CONCURRENCY", "0")
+    assert build().verify_concurrency == min(8, os.cpu_count() or 1)
+    # An explicit argument always wins over the environment.
+    assert build(verify_concurrency=2).verify_concurrency == 2
+
+
+def test_verify_outputs_probes_every_part_within_concurrency_bound(
+    executor: FFmpegSplitExecutor, tmp_path: Path
+) -> None:
+    executor.verify_concurrency = 2
+    out_dir = tmp_path / "outbox" / "job"
+    pattern = _make_parts(out_dir, 6)
+    media = MediaInfo(duration_sec=12.0, decodable=True)
+
+    active = 0
+    max_active = 0
+    calls: list[str] = []
+    lock = threading.Lock()
+
+    def fake_probe(path: Path) -> MediaInfo:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(path.name)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+        return MediaInfo(duration_sec=2.0, decodable=True)
+
+    executor.probe = fake_probe  # type: ignore[method-assign]
+    result = executor._verify_outputs(out_dir, pattern, media, "job")
+
+    assert result["segment_count"] == 6
+    assert len(calls) == 6  # every part still gets a full probe, no sampling
+    assert max_active == 2  # the bounded pool is what actually limits workers
+    assert result["outputs"] == [str(out_dir / f"part_{i:03d}.mp4") for i in range(6)]
+
+
+def test_verify_outputs_part_failure_fails_closed(
+    executor: FFmpegSplitExecutor, tmp_path: Path
+) -> None:
+    executor.verify_concurrency = 3
+    out_dir = tmp_path / "outbox" / "job"
+    pattern = _make_parts(out_dir, 4)
+    media = MediaInfo(duration_sec=8.0, decodable=True)
+
+    def fake_probe(path: Path) -> MediaInfo:
+        if path.name == "part_002.mp4":
+            raise ExecutorInputError("input media could not be validated")
+        return MediaInfo(duration_sec=2.0, decodable=True)
+
+    executor.probe = fake_probe  # type: ignore[method-assign]
+    with pytest.raises(ExecutorToolError, match="failed media validation"):
+        executor._verify_outputs(out_dir, pattern, media, "job")
+
+
+def test_run_discards_outputs_when_part_verification_fails(
+    executor: FFmpegSplitExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media = make_media(tmp_path)
+    patch_input_media_seams(monkeypatch, executor)
+    out_dir = tmp_path / "outbox" / "job-4"
+
+    def fake_split(argv, parser, cancel_event):
+        # The real splitter would create these; mimic it via the popen seam.
+        _make_parts(out_dir, 3)
+        return 0
+
+    monkeypatch.setattr(executor, "_run_subprocess", fake_split)
+
+    def fake_probe(path: Path) -> MediaInfo:
+        if path.name == "part_001.mp4":
+            return MediaInfo(duration_sec=2.0, decodable=False)
+        return MediaInfo(duration_sec=2.0, decodable=True)
+
+    monkeypatch.setattr(executor, "probe", fake_probe)
+    with pytest.raises(ExecutorToolError, match="failed media validation"):
+        executor.run({"job_id": "job-4", "input_path": str(media)}, lambda _: None)
+    assert not out_dir.exists()  # no partial output survives a failed job
+
+
+def test_run_overlaps_input_decode_with_split(
+    executor: FFmpegSplitExecutor, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media = make_media(tmp_path)
+    monkeypatch.setattr(
+        executor,
+        "_read_media_info",
+        lambda source: MediaInfo(duration_sec=5.0, decodable=False),
+    )
+    decode_started = threading.Event()
+    decode_release = threading.Event()
+    split_saw_decode_in_flight = threading.Event()
+
+    def fake_decode(source: Path) -> bool:
+        decode_started.set()
+        decode_release.wait(timeout=2.0)
+        return True
+
+    def fake_split(argv, parser, cancel_event):
+        if decode_started.wait(timeout=2.0):
+            split_saw_decode_in_flight.set()
+        decode_release.set()
+        return 0
+
+    def fake_verify(
+        output_dir, output_pattern, media_info, job_id, *, pool=None, input_future=None
+    ):
+        return {
+            "job_id": job_id,
+            "outputs": [],
+            "segment_count": 0,
+            "source_duration_sec": 5.0,
+            "outputs_duration_sec": 5.0,
+            "total_bytes": 0,
+            "segment_sec": 3,
+        }
+
+    monkeypatch.setattr(executor, "_decode_media", fake_decode)
+    monkeypatch.setattr(executor, "_run_subprocess", fake_split)
+    monkeypatch.setattr(executor, "_verify_outputs", fake_verify)
+
+    executor.run({"job_id": "job-5", "input_path": str(media)}, lambda _: None)
+    assert split_saw_decode_in_flight.is_set()

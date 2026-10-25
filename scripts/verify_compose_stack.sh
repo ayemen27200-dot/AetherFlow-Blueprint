@@ -43,6 +43,7 @@ esac
   echo "FAIL: unsafe working directory" >&2; exit 1
 }
 DATA_DIR="$WORK_DIR/data"
+SEED_DIR="$DATA_DIR/seed"
 ENV_FILE="$WORK_DIR/smoke.env"
 OVERRIDE_FILE="$WORK_DIR/override.yml"
 DIAG_LOG="$WORK_DIR/diag.log"
@@ -51,6 +52,10 @@ HEALTH_JSON="$WORK_DIR/health.json"
 LAST_STATUS="$WORK_DIR/last-status.json"
 CORRUPT_JSON="$WORK_DIR/corrupt.json"
 CONFIG_RENDERED="$WORK_DIR/compose-config.yml"
+# Unique named volume: ownership stays in the container namespace, which works
+# identically on rootful Docker and on userns-remapped/rootless runners (a
+# host bind mount would not, because host uid 1000 is a different uid there).
+VOLUME_NAME="${PROJECT}_data"
 : > "$DIAG_LOG"
 
 TOKEN="compose-smoke-token-${RUN_ID}"
@@ -111,7 +116,7 @@ fi
 EXISTING="$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" -q)"
 [[ -z "$EXISTING" ]] || fail "project name $PROJECT already exists; aborting to avoid touching foreign resources"
 
-section "1. isolated env file and data directory"
+section "1. isolated env file and seed directory"
 # Fail closed if anything ever points the temp env path at the checkout.
 [[ "$ENV_FILE" != "$REPO_ROOT/.env" ]] || fail "env path must stay inside the temp directory"
 (
@@ -128,12 +133,14 @@ EOF
 )
 chmod 600 "$ENV_FILE"
 [[ "$(stat -c '%a' "$ENV_FILE")" == "600" ]] || fail "temp env file is not mode 0600"
-mkdir -p "$DATA_DIR/upload_store" "$DATA_DIR/outputs"
-chmod 750 "$DATA_DIR" "$DATA_DIR/upload_store" "$DATA_DIR/outputs"
+# Seed files live in the temp directory; world-readable is sufficient for a
+# read-only seed mount and no production data ever lands here.
+mkdir -p "$SEED_DIR"
+chmod 755 "$WORK_DIR" "$DATA_DIR" "$SEED_DIR"
 
-# Compose override remaps every bind mount and env file to the temp directory,
-# and gives both application services a per-run unique image tag. All paths
-# are absolute so resolution never depends on the override file's directory.
+# Compose override replaces the data bind mount with a per-run unique named
+# volume (durable under down -v scoped to this project only), keeps the
+# read-only config bind, and gives both services a per-run unique image tag.
 cat > "$OVERRIDE_FILE" <<EOF
 services:
   orchestrator:
@@ -141,15 +148,17 @@ services:
     env_file:
       - $ENV_FILE
     volumes:
-      - $DATA_DIR:/app/data
+      - $VOLUME_NAME:/app/data
       - $REPO_ROOT/config:/app/config:ro
   worker:
     image: $IMAGE_REF
     env_file:
       - $ENV_FILE
     volumes:
-      - $DATA_DIR:/app/data
+      - $VOLUME_NAME:/app/data
       - $REPO_ROOT/config:/app/config:ro
+volumes:
+  $VOLUME_NAME:
 EOF
 
 section "2. compose config validation"
@@ -158,31 +167,40 @@ section "2. compose config validation"
 if grep -Eq 'published:.*8000' "$CONFIG_RENDERED"; then
   fail "orchestrator port 8000 is published to the host"
 fi
-# The rendered config must reference the temp data dir, never ./data.
-grep -Fq "$DATA_DIR" "$CONFIG_RENDERED" || fail "override did not remap the data bind mount"
+# The rendered config must use the unique named volume and never bind the
+# repository data directory.
+grep -Fq "$VOLUME_NAME" "$CONFIG_RENDERED" || fail "override did not install the isolated named volume"
 ! grep -Fq "$REPO_ROOT/data:" "$CONFIG_RENDERED" || fail "rendered config still binds the repository data directory"
-echo "config valid; isolated mounts; no host publication of port 8000"
+echo "config valid; isolated named volume; no host publication of port 8000"
 
-cp tests/fixtures/sample_5s.mp4 "$DATA_DIR/upload_store/up-sample-5s.mp4"
-python3 - "$DATA_DIR" <<'PY'
+cp tests/fixtures/sample_5s.mp4 "$SEED_DIR/up-sample-5s.mp4"
+python3 - "$SEED_DIR" <<'PY'
 import sys
 from pathlib import Path
-data_dir = Path(sys.argv[1])
-src = (data_dir / "upload_store" / "up-sample-5s.mp4").read_bytes()
+seed = Path(sys.argv[1])
+src = (seed / "up-sample-5s.mp4").read_bytes()
 data = bytearray(src)
 mid = len(data) // 2
 data[mid:mid + 4096] = b"\x00" * 4096
-(data_dir / "upload_store" / "up-corrupt.mp4").write_bytes(data)
+(seed / "up-corrupt.mp4").write_bytes(data)
 PY
 
 section "3. build and start the isolated stack"
 "${COMPOSE[@]}" build > "$BUILD_LOG" 2>&1
 echo "image build OK (full log: $BUILD_LOG)"
-# The containers run as the non-root uid 1000; hand the temp data tree to
-# that uid from inside the image (works without host root and never relaxes
-# permissions to world-writable).
-"${COMPOSE[@]}" run --rm --no-deps --user root orchestrator \
-  chown -R 1000:1000 /app/data >/dev/null
+# Seed the named volume from inside the container namespace: the one-shot
+# root container creates the data layout, copies the read-only seed objects
+# and hands everything to the non-root uid 1000 with 0750/0640 modes. This is
+# what makes the run identical on rootful and userns-remapped Docker daemons.
+"${COMPOSE[@]}" run --rm --no-deps --user root \
+  -v "$SEED_DIR:/seed:ro" orchestrator bash -c '
+    set -euo pipefail
+    mkdir -p /app/data/upload_store /app/data/outputs
+    cp /seed/up-sample-5s.mp4 /seed/up-corrupt.mp4 /app/data/upload_store/
+    chown -R 1000:1000 /app/data
+    chmod 750 /app/data /app/data/upload_store /app/data/outputs
+    chmod 640 /app/data/upload_store/*
+  '
 "${COMPOSE[@]}" up -d
 
 section "4. wait for API health (inside the compose network)"
@@ -251,7 +269,10 @@ JOB2="$(api_call POST /jobs '{"type":"split","file":"up-corrupt.mp4"}' | job_id)
 [[ "$(wait_terminal "$JOB2")" == "failed" ]] || fail "corrupt job was not marked failed"
 api_call GET "/jobs/$JOB2" | tee "$CORRUPT_JSON"
 grep -q '"error_type": *"INVALID_INPUT"' "$CORRUPT_JSON" || fail "expected INVALID_INPUT"
-[[ ! -e "$DATA_DIR/outputs/$JOB2" ]] || fail "partial output survived a failed job"
+# The data volume is container-namespace storage; check from inside the
+# worker container that no partial output directory survived.
+"${COMPOSE[@]}" exec -T worker test ! -e "/app/data/outputs/$JOB2" \
+  || fail "partial output survived a failed job"
 
 section "8. worker restart durability"
 "${COMPOSE[@]}" restart worker >/dev/null

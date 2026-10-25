@@ -63,7 +63,9 @@ def test_verifier_uses_a_unique_compose_project_and_image(verifier_text: str) ->
 
 def test_teardown_is_scoped_to_the_unique_project(verifier_text: str) -> None:
     down_lines = [
-        line for line in verifier_text.splitlines() if " down " in line
+        line
+        for line in verifier_text.splitlines()
+        if " down " in line and not line.lstrip().startswith("#")
     ]
     assert down_lines, "expected a scoped compose down in cleanup"
     for line in down_lines:
@@ -84,12 +86,26 @@ def test_temp_env_file_is_private_and_data_is_never_world_writable(
     assert "chmod 777" not in verifier_text
 
 
-def test_verifier_remaps_bind_mounts_into_the_temp_directory(verifier_text: str) -> None:
+def test_verifier_uses_a_unique_named_volume_not_a_repo_bind_mount(
+    verifier_text: str,
+) -> None:
     assert "override.yml" in verifier_text
-    assert "$DATA_DIR:/app/data" in verifier_text
-    # The repository .env is never created or used by the verifier.
+    # Data lives in a per-run unique named volume (rootless-safe), never in a
+    # bind mount against the repository checkout.
+    assert 'VOLUME_NAME="${PROJECT}_data"' in verifier_text
+    assert "$VOLUME_NAME:/app/data" in verifier_text
+    assert "$DATA_DIR:/app/data" not in verifier_text
     assert 'cat > "$REPO_ROOT/.env"' not in verifier_text
     assert '> "$REPO_ROOT/.env"' not in verifier_text
+    # The volume is seeded inside the container namespace and handed to uid
+    # 1000 with safe modes, never world-writable.
+    assert "chown -R 1000:1000 /app/data" in verifier_text
+    assert "chmod 750 /app/data" in verifier_text
+
+
+def test_partial_output_check_runs_inside_the_container(verifier_text: str) -> None:
+    # With a named volume there is no host-side data path to probe.
+    assert 'exec -T worker test ! -e "/app/data/outputs/$JOB2"' in verifier_text
 
 
 def test_verifier_proves_non_interference(verifier_text: str) -> None:

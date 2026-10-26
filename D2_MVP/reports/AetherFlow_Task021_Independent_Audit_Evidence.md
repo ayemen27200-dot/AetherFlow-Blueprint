@@ -2,52 +2,73 @@
 
 التاريخ: 2026-10-26
 الفرع: `arena/940efcbe-aetherflow-blueprint` — PR #6 مفتوح، غير مدموج.
-الالتزام موضوع التدقيق: `038479be93625c5eb2d3f804881e31bffb181b3c` (الرأس وقت إعداد هذه الحزمة).
+الرأس النهائي للحزمة (رأس الفرع الحالي): `70a2efad69c490ed276b0203db190703d70af2a3`.
+الالتزام موضوع التدقيق الأصلي: `038479be93625c5eb2d3f804881e31bffb181b3c` — يبقى
+في السجل التاريخي أدناه ولم يعد رأس الفرع.
 الغرض: إغلاق نقاط تحقق المراجعة المستقلة (حالة CI، نتائج الفحوص الفعلية، مصفوفة
 قبول G2 كاملة، وحدود وظيفة الرفع) دون أي تغيير في سلوك الكود أو مخطط SQLite أو
 عقد OpenAPI. لا يعلّق هذا التقرير قبول G2 ولا يعدّل أي معيار.
 
 ## 1) ربط تشغيل CI بالالتزام الكامل (قابل للتحقق عبر GitHub API)
 
-- رأس هذه الحزمة نفسها: `05a30f25a26bf0987faef6c3992719e8359c8c1c`، وتشغيله
-  [40406893165](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40406893165)
-  — الوظيفتان `success` ([verify](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40406893165/job/121866931267)
-  و[compose-smoke](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40406893165/job/121866931085))،
-  وأداة `pytest-results` الخاصة به المعرّف `12691358245` (غير منتهية الصلاحية).
-- دليل الالتزام موضع التدقيق الأصلي `038479b…`: التشغيل
-  [40405255560](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40405255560)
-  — الحدث `pull_request`، الفرع `arena/940efcbe-aetherflow-blueprint`،
-  و`head_sha` من استعلام API يساوي حرفيًا
-  `038479be93625c5eb2d3f804881e31bffb181b3c`؛ الحالة `completed` والنتيجة `success`.
+### 1.1 الدليل النهائي — على رأس الحزمة الحالي `70a2efa`
+
+- الرأس `70a2efad69c490ed276b0203db190703d70af2a3` وتشغيله
+  [40407250031](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40407250031):
+  الحدث `pull_request`، و`head_sha` من استعلام API يساوي الرأس حرفيًا،
+  الحالة `completed` والنتيجة `success` (بدأ 21:47:09Z واكتمل 22:13:53Z).
 - الوظيفتان (check-runs على نفس الالتزام، كلتاهما `success`):
-  1. [Specs, lint and tests](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40405255560/job/121861234312) — كل خطواتها `success`:
-     Validate YAML specs، Validate OpenAPI 3.1 contract، Byte-compile،
-     **Ruff lint**، **Run test suite**، Publish test count summary،
-     Upload machine-readable test results.
-  2. [Docker Compose clean-host stack](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40405255560/job/121861234548) —
+  1. [Specs, lint and tests](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40407250031/job/121868083823) —
+     خطواتها الـ15 كلها `success`، ومنها Validate YAML specs، Validate OpenAPI
+     3.1 contract، Byte-compile، **Ruff lint**، **Run test suite**، Publish test
+     count summary وUpload machine-readable test results.
+  2. [Docker Compose clean-host stack](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40407250031/job/121868083521) —
      خطوة التحقق المعزول `success`؛ خطوتا النشر عند الفشل `skipped` (لأن الفشل لم يحدث).
-- الحدود الصادقة: بيئة ساندبوكس Arena تمنع تنزيل بايتات السجلات وأداة JUnit
-  (التوجيه إلى `*.blob.core.windows.net` و`results-receiver.actions.githubusercontent.com`
-  خارج قائمة السماح الشبكية، والخطأ الفعلي `EOF` بعد إعادة التوجيه). لذلك لا
-  أستطيع لصق سجل الرانر حرفيًا من هنا، لكن بيانات واجهة API أعلاه (الحالات
-  والخطوط والأداة) قابلة لإعادة الاستقصاء بأمر:
-  `gh api repos/ayemen27200-dot/AetherFlow-Blueprint/commits/038479be93625c5eb2d3f804881e31bffb181b3c/check-runs`.
-- أداة النتائج الآلية من التشغيل الفعلي (غير منتهية الصلاحية، 4407 بايت):
-  الاسم `pytest-results`، ومعرّفها `12691575611`، ورابط تنزيلها بعد مصادقة
-  GitHub: `https://api.github.com/repos/ayemen27200-dot/AetherFlow-Blueprint/actions/artifacts/12691575611/zip`
-  — يستطيع المراجع تنزيل `junit.xml` الخاص بالرانر مباشرةً. التعليقات
-  التوضيحية على check-run لا تحوي أي فشل؛ فقط تحذيرات إهمال Node.js 20 وإشعار
-  ترقية ubuntu-latest (بنية تحتية، لا صلة بالكود).
-- مجموعة check-suite ثالثة من تطبيق Vercel ظهرت `queued`؛ لا علاقة لها
+- أداة النتائج الآلية لهذا التشغيل (بيانات واجهة API فقط): الاسم `pytest-results`،
+  المعرّف `12693865379`، الحجم المسجّل 4422 بايت، `expired=false`، ورابطها بعد
+  مصادقة GitHub:
+  `https://api.github.com/repos/ayemen27200-dot/AetherFlow-Blueprint/actions/artifacts/12693865379/zip`.
+- ملاحظة شفافية عن طول التشغيل: خطوة «Install FFmpeg and ffprobe» استغرقت نحو
+  26 دقيقة لبطء مرآة apt على الرانر (تأخر بنية تحتية عابر، سبق أن رُصد في تشغيلات
+  سابقة) ثم اكتملت `success`؛ لا صلة لذلك بالدفعات التوثيقية التي لا تغيّر كودًا.
+
+### 1.2 السجل التاريخي — تشغيلات الرؤوس السابقة (ليست رأس الفرع الحالي)
+
+تبقى هنا للشفافية وكشف سلسلة الأدلة كاملة، ولا يجوز الاستشهاد بها كدليل على الرأس
+النهائي:
+
+| الالتزام | التشغيل | النتيجة | أداة pytest-results (معرّف / حجم API) |
+|---|---|---|---|
+| `05a30f25a26bf0987faef6c3992719e8359c8c1c` | [40406893165](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40406893165) — [verify](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40406893165/job/121866931267) / [compose](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40406893165/job/121866931085) | `success` للمهمتين | `12691358245` / 4409 بايت |
+| `038479be93625c5eb2d3f804881e31bffb181b3c` (موضع التدقيق الأصلي) | [40405255560](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40405255560) — [verify](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40405255560/job/121861234312) / [compose](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40405255560/job/121861234548) | `success` للمهمتين | `12691575611` / 4407 بايت |
+
+### 1.3 حدود التحقق الصادقة (لا أرقام من JUnit لم تُقرأ)
+
+- بيئة ساندبوكس Arena تمنع تنزيل بايتات السجلات وأدوات JUnit: التوجيه إلى
+  `*.blob.core.windows.net` و`results-receiver.actions.githubusercontent.com`
+  خارج قائمة السماح الشبكية، والخطأ الفعلي `EOF` بعد إعادة التوجيه. لذلك **لم
+  تُستخرج أعداد اختبارات الرانر من XML في هذه الحزمة**؛ المذكور عن الرانر هو
+  حالات الخطوات/الوظائف وبيانات الأداة (وجود، معرّف، حجم، انتهاء صلاحية) عبر
+  واجهة API فقط، والأعداد التفصيلية المثبتة قسم 2.2 هي نتائج إعادة تشغيل محلية
+  موسومة صراحةً كذلك. المراجع المستقل يملك تنزيل الأداة وتحليل XML بنفسه عبر
+  روابط القسمين 1.1 و1.2.
+- بيانات واجهة API أعلاه قابلة لإعادة الاستقصاء بأمر:
+  `gh api repos/ayemen27200-dot/AetherFlow-Blueprint/commits/70a2efad69c490ed276b0203db190703d70af2a3/check-runs`.
+- التعليقات التوضيحية على check-run لا تحوي أي فشل؛ فقط تحذيرات إهمال Node.js 20
+  وإشعار ترقية ubuntu-latest (بنية تحتية، لا صلة بالكود).
+- مجموعة check-suite من تطبيق Vercel ظهرت `queued` في بعض الفحوص؛ لا علاقة لها
   بمشغّل GitHub Actions ولا ببوابات هذا المستودع.
 
 ## 2) نتائج pytest/ruff/OpenAPI وسبب كل اختبار متخطّى
 
-### 2.1 نتائج الرانر (من بنية التشغيل القابلة للتحقق)
+### 2.1 نتائج الرانر (من بنية التشغيل النهائي القابلة للتحقق)
 
-خطوتا `Ruff lint` و`Validate OpenAPI 3.1 contract` و`Run test suite` كلها
-`success` على الالتزام المذكور، مع رفع أداة JUnit (رابطها أعلاه) ليتمكن
-المراجع من فحص الأعداد والتخطيات بنفسه.
+على التشغيل النهائي 40407250031 (الرأس `70a2efa`): خطوات `Ruff lint` و
+`Validate OpenAPI 3.1 contract` و`Run test suite` كلها `success`، مع رفع أداة
+JUnit المعرّفة 12693865379 ليتمكن المراجع من فحص الأعداد والتخطيات بنفسه. لم
+تُقرأ بايتات الأداة من بيئة الإعداد (القيد موثق في 1.3)، فلا تُنسب أي أعداد
+للرانر هنا؛ الأعداد المثبتة رقميًا في القسم التالي هي نتائج إعادة تشغيل محلية
+موسومة كذلك، ونفس الخطوات نجحت أيضًا على تشغيليّ السجل التاريخي في 1.2.
 
 ### 2.2 إعادة محلية بالأوامر نفسها (ساندبوكس البناء، ثنائي FFmpeg 7.0.2 static)
 
@@ -99,7 +120,7 @@
 
 | البند | الحالة | الدليل المحدد |
 |---|---|---|
-| `docker compose up` على تثبيت نظيف موثق | اجتاز تشغيليًا | وظيفة compose-smoke على الرانر في التشغيل 40405255560 والتشغيلات السابقة (سكربت 11 قسمًا معزولًا، بلا continue-on-error) |
+| `docker compose up` على تثبيت نظيف موثق | اجتاز تشغيليًا | وظيفة compose-smoke على الرانر في التشغيل النهائي 40407250031 (الرأس `70a2efa`) والسجل التاريخي 40405255560/40406893165 والتشغيلات الأقدم (سكربت 11 قسمًا معزولًا، بلا continue-on-error) |
 | Caddy يصدر Let's Encrypt عامًا عند توفر DNS | **غير متحقق** | المثبَت `tls internal` لـlocalhost فقط؛ الشهادة العامة تتطلب مضيف DNS ومنافذ عامة |
 | Uvicorn غير مكشوف مباشرة للعامة | اجتاز | `tests/unit/test_compose_config.py` (إعداد `expose` بلا `ports`) + فحص منشور المنافذ في سكربت العزل |
 | السجلات منظمة بلا أسرار/بيانات وسائط | اجتاز جزئيًا | `test_failure_logs_never_contain_filesystem_paths` وفحص توكن سجلات الحاويات في compose-smoke؛ **التدقيق الشامل لكل المكونات غير متحقق** ويبقى بندًا مفتوحًا |

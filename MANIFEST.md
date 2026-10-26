@@ -135,13 +135,17 @@ a JUnit artifact in CI, not estimated.
   Let's Encrypt certificate still needs a real DNS host; only the internal
   localhost certificate has been observed on the runner.
 - Long-media performance has been measured honestly in the two-core build
-  environment via `scripts/benchmark_long_media.sh` (latest run): the
-  30-minute case takes 28.30s wall (target <15s) and the two-hour case
-  121.25s (target <60s); pure stream-copy split alone is 0.90s/3.50s, so
-  the mandatory decode verification dominates. The script records media
-  characteristics and accepts representative real files via
-  `BENCH_30M_INPUT`/`BENCH_2H_INPUT`. Neither target is met here, and the
-  VPS run (or a documented criterion review with the optimization plan)
+  environment via `scripts/benchmark_long_media.sh`, which now runs three
+  full-path repeats per duration and records median/min: after the Task020
+  bounded-concurrent-verification optimization the medians are 18.50s for
+  the 30-minute case (runs 17.68/18.75/18.50, target <15s) and 68.95s for
+  the two-hour case (runs 71.34/68.95/68.08, target <60s); pure
+  stream-copy split alone is 0.91s/5.84s, so the mandatory decode
+  verification dominates. The script records media characteristics and
+  accepts representative real files via
+  `BENCH_30M_INPUT`/`BENCH_2H_INPUT`. Neither target is met on this host,
+  and the VPS run (or a documented criterion review with the optimization
+  plan)
   that can close the criteria remains pending. Full matrix:
   `D2_MVP/07_G2_EVIDENCE_LEDGER.md`.
 - A full secret-leak audit of every component has not been performed;

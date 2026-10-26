@@ -161,6 +161,68 @@ def test_g2_create_process_and_verify_real_split(environment) -> None:
     _assert_no_absolute_path_leak(listed_job["output_paths"])
 
 
+class _LifecycleRecordingExecutor:
+    """Wrap the real FFmpeg executor and observe the row while it runs.
+
+    The worker must flip the durable job row to ``processing`` (with
+    ``started_at``) before invoking the executor, so the API has to expose
+    that intermediate state while real FFmpeg work is in flight — not just
+    the queued/completed endpoints of the lifecycle.
+    """
+
+    def __init__(self, inner: FFmpegSplitExecutor, client: TestClient, token: str):
+        self._inner = inner
+        self._client = client
+        self._token = token
+        self.observed_status: str | None = None
+        self.observed_started_at: str | None = None
+
+    def run(self, job_spec: dict, on_progress) -> dict:
+        job_id = job_spec["job_id"]
+        record = self._client.get(
+            f"/jobs/{job_id}",
+            headers={"Authorization": f"Bearer {self._token}"},
+        ).json()
+        self.observed_status = record["status"]
+        self.observed_started_at = record["started_at"]
+        return self._inner.run(job_spec, on_progress)
+
+
+def test_g2_job_moves_through_processing_state_with_real_ffmpeg(environment) -> None:
+    _, client, db_path, store_dir, output_dir = environment
+    job_id = _create_job(client, UPLOAD_ID)
+
+    real_executor = FFmpegSplitExecutor.from_config(
+        allowed_base_dir=store_dir,
+        output_base_dir=output_dir,
+        segment_sec=3,
+        ffmpeg_cmd=FFMPEG,
+        ffprobe_cmd=shutil.which("ffprobe"),
+    )
+    recording = _LifecycleRecordingExecutor(real_executor, client, TOKEN)
+    worker = QueueWorker(
+        SQLiteQueue(db_path), recording, LocalUploadStore(store_dir),
+        output_base_dir=output_dir,
+    )
+    assert worker.process_one() is True
+    worker._queue.close()
+
+    # The intermediate state was observed through the public API while the
+    # real FFmpeg split was executing, not assumed from queue internals.
+    assert recording.observed_status == "processing"
+    assert recording.observed_started_at is not None
+
+    record = client.get(f"/jobs/{job_id}", headers=AUTH).json()
+    assert record["status"] == "completed"
+    assert record["started_at"] and record["completed_at"]
+    assert record["retry_count"] == 0
+    _assert_no_absolute_path_leak(record["output_paths"])
+    for ref in record["output_paths"]:
+        path = _resolve_reference(output_dir, ref)
+        assert path.is_file() and path.stat().st_size > 0
+        _decode_clean(path)
+
+
 def test_g2_path_like_upload_id_is_rejected_at_the_api(environment) -> None:
     _, client, _, _, _ = environment
     response = client.post(

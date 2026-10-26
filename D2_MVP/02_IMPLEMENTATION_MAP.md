@@ -16,17 +16,24 @@ by themselves close G2, and unproven acceptance items stay explicitly marked.
 | `agent/cli.py` | Implemented, two explicitly separate paths: `aetherflow worker run` (durable queue consumer) and `aetherflow split FILE` (trusted local path, absolute path inside an allowed base; never touches the queue) | `test_g2_cli_worker_processes_one_queued_job`, `test_g2_cli_local_split_*` |
 | `docker/docker-compose.yml` | Implemented. Real `aetherflow worker run` service sharing one SQLite file and one named volume with the orchestrator; Uvicorn `expose`-only, Caddy is the sole published entry point, non-root containers, `no-new-privileges`, `cap_drop: ALL` | Isolated eleven-section `scripts/verify_compose_stack.sh`, green in CI on a clean runner. A public Let's Encrypt certificate still requires a real DNS host (only the internal localhost certificate has been observed) |
 
-## Upload boundary (why no `POST /uploads` is needed for this path)
+## Upload boundary (no `POST /uploads` exists in the current API)
 
-Remote API `JobSpec.file` must be an opaque upload ID issued by
-`POST /uploads`; server filesystem paths from untrusted clients are rejected
-at the API (`400`) and again at the queue boundary. `POST /uploads` (HTTP
-object ingestion) is a D3 endpoint and is deliberately not implemented in D2.
-The D2 MVP ingests objects out-of-band into the same trusted store the worker
-reads from (`LocalUploadStore`), which keeps the split job path fully
-testable without building the larger upload subsystem. The local CLI path is
-the only place filesystem paths are accepted, and only when absolute and
-inside the caller-supplied trusted base.
+**Important wording clarification requested by independent audit:** the D1
+contract specifies `POST /uploads`, but that endpoint is **not implemented
+and not routed in the D2 code — no HTTP route in `orchestrator/main.py`
+issues or registers upload ids**. The D1 OpenAPI description remains the
+target contract for D3; it does not describe a working D2 endpoint.
+
+In D2 the token in `JobSpec.file` is simply the object name chosen when the
+object is placed into the trusted store **out-of-band** (operator/test
+provisioning into `LocalUploadStore`'s directory); neither the API nor the
+queue mints it. The worker later resolves that opaque name to a file inside
+the trusted store and rejects path-like values. Server filesystem paths from
+untrusted clients are rejected at the API (`400`) and again at the queue
+boundary. This keeps the split job path fully testable without building the
+larger upload subsystem. The local CLI `split` path is the only place
+filesystem paths are accepted, and only when absolute and inside the
+caller-supplied trusted base.
 
 ## Explicitly not implemented in D2 (later milestones)
 

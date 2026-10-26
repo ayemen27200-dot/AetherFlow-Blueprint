@@ -43,10 +43,15 @@ The CLI supports the two D2 execution paths:
   — runs the FFmpeg executor directly on a trusted local file; this path
   never touches the queue and rejects relative paths.
 
-`POST /uploads` HTTP ingestion is not part of D2: test and operator workflows
-place objects in the upload store out-of-band, and the API accepts only the
-resulting opaque upload ids. Later-milestone executors still return an
-explicit not-implemented response rather than pretending work happened.
+`POST /uploads` HTTP ingestion is not part of D2 — **no such HTTP endpoint
+exists in the current API**. In the current stage, test and operator
+workflows place objects into the upload store out-of-band (the store, not the
+API, names the object); the API itself neither mints nor exposes upload ids.
+The API accepts only the resulting opaque token in `JobSpec.file`, and the
+store resolves it inside the trusted store directory. The D1 contract's
+`POST /uploads` remains specified-but-unimplemented and belongs to D3.
+Later-milestone executors still return an explicit not-implemented response
+rather than pretending work happened.
 
 ## VPS with Docker Compose
 
@@ -73,7 +78,7 @@ openapi-spec-validator D1_FOUNDATION/03_API_SPEC.yaml  # available with the dev 
 ## Security and model integrity
 
 - Never commit `.env`, production tokens, private keys, uploaded media, SQLite state, or downloaded model weights.
-- Remote job requests must reference a server-issued upload ID; never accept arbitrary filesystem paths from an untrusted client.
+- Remote job requests must reference the opaque upload token of an object already placed in the trusted store through the out-of-band D2 ingestion path; never accept arbitrary filesystem paths from an untrusted client. The API neither issues nor registers these tokens in D2 — that is the deferred D3 `POST /uploads` subsystem.
 - A `FILL_ON_FIRST_RUN` hash is **not** a trusted integrity lock. Pin model revisions and verify SHA-256 values through a trusted process before production; do not silently trust the first download.
 - Cloud processing requires explicit consent and policy/quota checks in the implementation. Documentation does not prove these controls exist in code.
 

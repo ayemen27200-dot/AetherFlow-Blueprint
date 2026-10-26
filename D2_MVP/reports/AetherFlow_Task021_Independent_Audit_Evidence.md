@@ -9,7 +9,13 @@
 
 ## 1) ربط تشغيل CI بالالتزام الكامل (قابل للتحقق عبر GitHub API)
 
-- التشغيل: [40405255560](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40405255560)
+- رأس هذه الحزمة نفسها: `05a30f25a26bf0987faef6c3992719e8359c8c1c`، وتشغيله
+  [40406893165](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40406893165)
+  — الوظيفتان `success` ([verify](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40406893165/job/121866931267)
+  و[compose-smoke](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40406893165/job/121866931085))،
+  وأداة `pytest-results` الخاصة به المعرّف `12691358245` (غير منتهية الصلاحية).
+- دليل الالتزام موضع التدقيق الأصلي `038479b…`: التشغيل
+  [40405255560](https://github.com/ayemen27200-dot/AetherFlow-Blueprint/actions/runs/40405255560)
   — الحدث `pull_request`، الفرع `arena/940efcbe-aetherflow-blueprint`،
   و`head_sha` من استعلام API يساوي حرفيًا
   `038479be93625c5eb2d3f804881e31bffb181b3c`؛ الحالة `completed` والنتيجة `success`.

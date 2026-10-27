@@ -31,6 +31,15 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      - name: Install FFmpeg and ffprobe for integration tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+          command -v ffmpeg
+          command -v ffprobe
+          ffmpeg -version
+          ffprobe -version
+
       - name: Install project with development dependencies
         run: |
           python -m pip install --upgrade pip
@@ -49,4 +58,75 @@ jobs:
         run: ruff check .
 
       - name: Run test suite
-        run: pytest -q
+        env:
+          # Hard-fail (via tests/integration/test_media_toolchain.py) instead
+          # of silently skipping the real media tests if a binary is missing.
+          AETHERFLOW_REQUIRE_MEDIA_BINARIES: "1"
+        run: |
+          mkdir -p test-results
+          pytest -q -ra --junitxml=test-results/junit.xml
+
+      - name: Publish test count summary
+        if: always()
+        run: python scripts/summarize_junit.py test-results/junit.xml
+
+      - name: Upload machine-readable test results
+        # Published as a run artifact so exact pass/fail/skip counts can be
+        # audited independently of the runner's raw Azure log stream.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results
+          path: test-results/junit.xml
+          if-no-files-found: error
+          retention-days: 30
+
+  compose-smoke:
+    name: Docker Compose clean-host stack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Scoped to this job: on failure only, post the verifier output as a PR
+      # comment so reviewers can read diagnostics without Azure-backed log
+      # downloads. This never changes repository content.
+      pull-requests: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # The published image already bundles FFmpeg/FFprobe; no apt step needed.
+      - name: Run clean-host stack verification
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/verify_compose_stack.sh 2>&1 | tee compose-run.log
+
+      - name: Publish failure diagnostics to the pull request
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          [[ -n "$PR_NUMBER" ]] || exit 0
+          {
+            echo "### compose-smoke failure diagnostics (run ${{ github.run_id }})"
+            echo "The verifier runs under a unique per-run Compose project in a"
+            echo "mktemp directory; the transcript below includes the container"
+            echo "state and per-service logs captured before its scoped teardown."
+            echo '<details><summary>verifier output (tail)</summary>'
+            echo '```text'
+            tail -c 50000 compose-run.log || true
+            echo '```'
+            echo '</details>'
+          } > comment-body.md
+          gh pr comment "$PR_NUMBER" --body-file comment-body.md
+
+      - name: Upload verifier transcript on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-smoke-transcript
+          path: compose-run.log
+          if-no-files-found: ignore
+          retention-days: 14

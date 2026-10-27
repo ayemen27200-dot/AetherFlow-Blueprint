@@ -42,8 +42,19 @@ sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plug
 
 cd "$ROOT_DIR"
 python3 scripts/init_wizard.py
-mkdir -p data
-chmod 750 data
+mkdir -p data data/upload_store data/outputs
+# The application containers run as the non-root uid 1000 defined in the
+# image; the shared bind mount must be writable by that uid. Set safe modes
+# first (the invoking user still owns the fresh directories), then transfer
+# ownership to the container uid. World-writable data directories are never
+# acceptable, so a failed chown aborts the install instead of falling back.
+chmod 750 data data/upload_store data/outputs
+if ! sudo -n chown -R 1000:1000 data; then
+  echo "ERROR: could not chown data/ to the container uid 1000." >&2
+  echo "       Run: sudo chown -R 1000:1000 '$ROOT_DIR/data' (modes stay 0750)." >&2
+  echo "       A world-writable fallback is intentionally not provided." >&2
+  exit 1
+fi
 
 # Use sudo for Docker unless the current account already has daemon access.
 DOCKER=(docker)

@@ -1,17 +1,30 @@
 name: aetherflow
+
+# Both application services build the same image (ffmpeg, sqlite3 and the
+# `aetherflow` CLI are baked in by docker/Dockerfile.orchestrator) and share
+# one bind-mounted data directory, so the API's SQLite file and the worker's
+# upload/output directories are literally the same files.
 services:
   orchestrator:
     build:
       context: ..
       dockerfile: docker/Dockerfile.orchestrator
+    image: aetherflow-local:latest
     restart: unless-stopped
     env_file:
-      - ../.env
+      # Optional: the stack also runs with environment variables supplied
+      # directly; the isolated smoke verifier injects its own temp env file
+      # via an override, so a missing .env must not be a hard error.
+      - path: ../.env
+        required: false
     environment:
       HOST: 0.0.0.0
       PORT: "8000"
+      # Container path; must stay identical to AETHERFLOW_DB_PATH below.
       DATABASE_PATH: /app/data/aetherflow.db
     expose:
+      # No `ports:` section on purpose: Uvicorn is reachable only inside the
+      # Compose network. Caddy is the sole host-published entry point.
       - "8000"
     volumes:
       - ../data:/app/data
@@ -22,6 +35,58 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  worker:
+    image: aetherflow-local:latest
+    restart: unless-stopped
+    env_file:
+      # Optional: the stack also runs with environment variables supplied
+      # directly; the isolated smoke verifier injects its own temp env file
+      # via an override, so a missing .env must not be a hard error.
+      - path: ../.env
+        required: false
+    environment:
+      # Same physical file as the orchestrator's DATABASE_PATH (WAL allows the
+      # multi-process access; busy_timeout serializes write contention).
+      AETHERFLOW_DB_PATH: /app/data/aetherflow.db
+      AETHERFLOW_UPLOAD_STORE: /app/data/upload_store
+      AETHERFLOW_OUTPUT_DIR: /app/data/outputs
+      AETHERFLOW_SEGMENT_SECONDS: "300"
+      AETHERFLOW_CONCURRENCY: "1"
+      AETHERFLOW_POLL_INTERVAL: "1.0"
+      AETHERFLOW_MAX_JOBS: "-1"
+      AETHERFLOW_LOG_LEVEL: "INFO"
+      # Blank => use the ffmpeg/ffprobe binaries installed inside the image.
+      AETHERFLOW_FFMPEG: ""
+      AETHERFLOW_FFPROBE: ""
+    command:
+      - aetherflow
+      - worker
+      - run
+      - --db-path
+      - /app/data/aetherflow.db
+      - --upload-store
+      - /app/data/upload_store
+      - --output-dir
+      - /app/data/outputs
+    depends_on:
+      orchestrator:
+        condition: service_started
+    volumes:
+      - ../data:/app/data
+      - ../config:/app/config:ro
+    # The worker exposes no network service; readiness means the shared
+    # database file is reachable from this container.
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /app/data/aetherflow.db || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     security_opt:
       - no-new-privileges:true
     cap_drop:

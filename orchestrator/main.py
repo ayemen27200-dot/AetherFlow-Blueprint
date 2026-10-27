@@ -13,8 +13,9 @@ Implemented in this layer (D2 scope):
 
 Out of scope here: ``POST /uploads``, SSE progress, cancellation, downloads,
 account/agent routes and all FFmpeg processing — those remain separate
-deliverables. ``/health`` stays explicitly degraded until active DB/worker
-checks are delivered in a later milestone.
+deliverables. ``/health`` actively probes the database (503 on failure,
+without internal details); worker liveness is not monitored until the D3
+heartbeat protocol exists.
 """
 
 from __future__ import annotations
@@ -25,9 +26,11 @@ import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from orchestrator.queue import (
@@ -233,6 +236,27 @@ def _safe_environment(payload: dict) -> str | None:
     return value if isinstance(value, str) and value in _ALLOWED_ENVIRONMENTS else None
 
 
+def _safe_output_references(output_paths: tuple[str, ...]) -> list[str]:
+    """Return only storage-root-relative output references.
+
+    The worker writes references relative to its private output base (e.g.
+    ``<job-id>/part_000.mp4``); absolute filesystem paths must never appear in
+    an API response, as they would disclose the server's storage layout. This
+    read-side guard is defence in depth: any absolute or parent-escaping
+    entry — only reachable through a direct database edit, since the worker
+    cannot write one — is omitted rather than leaked.
+    """
+    safe: list[str] = []
+    for entry in output_paths:
+        if not isinstance(entry, str) or not entry:
+            continue
+        candidate = Path(entry)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            continue
+        safe.append(entry)
+    return safe
+
+
 def _record_to_job(record: JobRecord) -> Job:
     """Map a full queue record onto the public Job response model."""
     payload = _load_checkpoint_payload(record.checkpoint_data)
@@ -241,7 +265,7 @@ def _record_to_job(record: JobRecord) -> Job:
         status=record.status,
         type=record.type,
         created_at=_iso_timestamp(record.created_at) or record.created_at,
-        output_paths=list(record.output_paths),
+        output_paths=_safe_output_references(record.output_paths),
         environment=_safe_environment(payload),
         priority=record.priority,
         error_type=record.error_type,
@@ -364,12 +388,25 @@ def get_job(job_id: str, queue: QueueDep) -> Job:
 
 
 @app.get("/health")
-async def health() -> dict[str, object]:
-    """Report scaffold status; production health must actively check DB and worker state."""
-    return {
-        "status": "degraded",
-        "components": {
-            "database": "not_implemented",
-            "worker": "not_implemented",
-        },
-    }
+async def health(request: Request) -> JSONResponse:
+    """Actively probe the durable database; fail clearly without leaking details.
+
+    Returns 200 only when the SQLite store answers a live ``SELECT 1``.
+    Any database error maps to a generic 503 body with no driver text,
+    SQL or filesystem path. Worker liveness stays ``not_monitored`` until
+    the D3 heartbeat protocol exists, so this endpoint never claims a
+    component state it cannot prove.
+    """
+    components = {"database": "ok", "worker": "not_monitored"}
+    try:
+        request.app.state.queue.ping()
+    except sqlite3.Error:
+        components["database"] = "error"
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "unhealthy", "components": components},
+        )
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"status": "healthy", "components": components},
+    )

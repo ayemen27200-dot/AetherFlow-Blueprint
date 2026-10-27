@@ -43,16 +43,43 @@ class _FailingQueue:
     def list_jobs(self, *, status: str | None = None, limit: int = 50):  # pragma: no cover
         raise sqlite3.OperationalError("simulated disk failure")
 
+    def ping(self) -> None:  # pragma: no cover - exercised by the health test
+        raise sqlite3.OperationalError("simulated disk failure")
+
 
 # --------------------------------------------------------------------------- #
 # Health and authentication
 # --------------------------------------------------------------------------- #
 
 
-def test_health_is_open_and_reports_degraded(client: TestClient) -> None:
+def test_health_is_open_and_reports_live_database(client: TestClient) -> None:
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json()["status"] == "degraded"
+    body = response.json()
+    assert body["status"] == "healthy"
+    assert body["components"]["database"] == "ok"
+    # Worker liveness must not be claimed before the D3 heartbeat exists.
+    assert body["components"]["worker"] == "not_monitored"
+
+
+def test_health_returns_503_without_leaking_database_details(
+    client: TestClient,
+) -> None:
+    # Simulated outage via a failing stand-in (not a real engine failure E2E).
+    original = client.app.state.queue
+    client.app.state.queue = _FailingQueue()
+    try:
+        response = client.get("/health")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "unhealthy"
+        assert body["components"]["database"] == "error"
+        # Generic body only: no driver text, SQL fragment or filesystem path.
+        assert "simulated" not in response.text
+        assert "sqlite" not in response.text.lower()
+        assert "/" not in response.text
+    finally:
+        client.app.state.queue = original
 
 
 def test_jobs_endpoints_require_bearer_token(client: TestClient) -> None:
@@ -464,13 +491,23 @@ def test_corrupt_output_paths_never_returns_500(
     assert listed["output_paths"] == []
 
 
-def test_valid_output_paths_still_serialize(client: TestClient, tmp_path) -> None:
-    job_id = _create_job_and_corrupt(
-        client, tmp_path, "output_paths", '["/out/a.mp4", "/out/b.mp4"]'
-    )
+def test_output_references_serialize_but_absolute_paths_never_leak(
+    client: TestClient, tmp_path
+) -> None:
+    # Direct database tampering (the worker itself can only write relative
+    # references): one safe reference, one absolute server path, one parent
+    # escape. The API must keep the safe reference and strip the rest.
+    tampered = '["job-1/part_000.mp4", "/srv/storage/secret.mp4", "../escape.mp4"]'
+    job_id = _create_job_and_corrupt(client, tmp_path, "output_paths", tampered)
     response = client.get(f"/jobs/{job_id}", headers=AUTH)
     assert response.status_code == 200
-    assert response.json()["output_paths"] == ["/out/a.mp4", "/out/b.mp4"]
+    assert response.json()["output_paths"] == ["job-1/part_000.mp4"]
+    assert "/srv/storage" not in response.text and ".." not in response.text
+
+    # The same guarantee applies to the list endpoint.
+    listing = client.get("/jobs", headers=AUTH)
+    listed = next(job for job in listing.json() if job["id"] == job_id)
+    assert listed["output_paths"] == ["job-1/part_000.mp4"]
 
 
 @pytest.mark.parametrize("bad_environment", ['"datacenter"', "123", "null", '["cloud"]'])

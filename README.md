@@ -1,8 +1,8 @@
 # AetherFlow Suite
 
-> Local-first, distributed video-processing orchestrator — specification and implementation scaffold.
+> Local-first, distributed video-processing orchestrator — blueprint, D2 MVP implementation and later-milestone scaffolds.
 
-**Status:** this repository is a blueprint plus a starter scaffold. It is not a finished video-processing product. The API, persistent queue, agent protocol, upload validation, real inference executors, cloud quota enforcement, and end-to-end tests must be implemented and verified before production use.
+**Status:** the D2 MVP split pipeline is implemented and covered by automated tests: authenticated job API, durable SQLite queue with claim fencing, a real worker, an FFmpeg split executor with mandatory full-decode verification, two CLI execution paths and a hardened Compose stack. It is not a finished video-processing product: `POST /uploads`, the agent protocol, ASR/ProPainter inference executors, cloud quota enforcement and the web UI remain later-milestone (D3–D5) work, and the G2 performance and public-TLS acceptance items are still open. See `D2_MVP/07_G2_EVIDENCE_LEDGER.md` for the evidence state and `D2_MVP/02_IMPLEMENTATION_MAP.md` for per-file status.
 
 ## What the design covers
 
@@ -16,10 +16,10 @@
 - `D0_MASTER_BLUEPRINT/`: architecture and constraints.
 - `D1_FOUNDATION/`: SQL, configuration policies, machine-readable OpenAPI 3.1 contract and runbook.
 - `D2_MVP/` to `D5_HARDENING/`: implementation tasks and acceptance gates.
-- `orchestrator/`, `agent/`, `executors/`: Python starter modules (some methods intentionally raise `NotImplementedError`).
-- `docker/`, `config/`, `scripts/`, `tests/`: deployment scaffold, settings, bootstrap scripts and fixture.
+- `orchestrator/`, `agent/`, `executors/`: the D2 job API, SQLite queue, worker, upload store and FFmpeg executor are implemented; D3/D4 modules (decision engine, quota, key proxy, Whisper/ProPainter/Modal executors, agent protocol) intentionally still raise `NotImplementedError`.
+- `docker/`, `config/`, `scripts/`, `tests/`: Compose deployment with a real worker service, settings, bootstrap/verification scripts and the unit/API/integration test suites plus the 5-second fixture.
 
-## Local setup (scaffold only)
+## Local setup
 
 Requirements: Python 3.11+ and FFmpeg for media tests.
 
@@ -34,7 +34,24 @@ pytest
 python scripts/validate_specs.py
 ```
 
-The CLI entry point currently supports initialization; job execution remains an implementation task. The source scaffold returns an explicit not-implemented response rather than pretending that jobs are processed.
+The CLI supports the two D2 execution paths:
+
+- `aetherflow worker run --upload-store DIR --output-dir DIR` — consumes
+  jobs created through the authenticated API and stored durably in SQLite
+  (the queue/worker path).
+- `aetherflow split /abs/path/media.mp4 --allowed-base DIR --output-dir DIR`
+  — runs the FFmpeg executor directly on a trusted local file; this path
+  never touches the queue and rejects relative paths.
+
+`POST /uploads` HTTP ingestion is not part of D2 — **no such HTTP endpoint
+exists in the current API**. In the current stage, test and operator
+workflows place objects into the upload store out-of-band (the store, not the
+API, names the object); the API itself neither mints nor exposes upload ids.
+The API accepts only the resulting opaque token in `JobSpec.file`, and the
+store resolves it inside the trusted store directory. The D1 contract's
+`POST /uploads` remains specified-but-unimplemented and belongs to D3.
+Later-milestone executors still return an explicit not-implemented response
+rather than pretending work happened.
 
 ## VPS with Docker Compose
 
@@ -61,7 +78,7 @@ openapi-spec-validator D1_FOUNDATION/03_API_SPEC.yaml  # available with the dev 
 ## Security and model integrity
 
 - Never commit `.env`, production tokens, private keys, uploaded media, SQLite state, or downloaded model weights.
-- Remote job requests must reference a server-issued upload ID; never accept arbitrary filesystem paths from an untrusted client.
+- Remote job requests must reference the opaque upload token of an object already placed in the trusted store through the out-of-band D2 ingestion path; never accept arbitrary filesystem paths from an untrusted client. The API neither issues nor registers these tokens in D2 — that is the deferred D3 `POST /uploads` subsystem.
 - A `FILL_ON_FIRST_RUN` hash is **not** a trusted integrity lock. Pin model revisions and verify SHA-256 values through a trusted process before production; do not silently trust the first download.
 - Cloud processing requires explicit consent and policy/quota checks in the implementation. Documentation does not prove these controls exist in code.
 
